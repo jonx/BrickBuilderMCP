@@ -470,16 +470,25 @@ try:
 
     @mcp.tool()
     def render_model(width: int = 800, height: int = 600) -> dict[str, Any]:
-        """Render the model as an isometric PNG and write it to ./render.png.
+        """Render the model as an isometric PNG.
 
-        Returns the file path. Built-in renderer draws each part as its colored AABB —
-        not photoreal, but instantly tells you what the model looks like.
+        Writes to ./renders/<timestamp>_<model>.png so the history is preserved —
+        come back later and scroll the renders folder to see how the model evolved.
+        Also updates ./renders/latest.png as a convenience pointer.
         """
-        out = Path("render.png").resolve()
+        from datetime import datetime
+
+        renders_dir = Path("renders").resolve()
+        renders_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
+        out = renders_dir / f"{stamp}_{safe_name}.png"
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height)
         out.write_bytes(png)
-        return {"ok": True, "path": str(out), "parts": len(STATE.parts),
-                "width": width, "height": height}
+        # Convenience latest pointer (real file, not symlink — works on all filesystems).
+        (renders_dir / "latest.png").write_bytes(png)
+        return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
+                "parts": len(STATE.parts), "width": width, "height": height}
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
 

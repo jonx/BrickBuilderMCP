@@ -24,3 +24,7 @@ ldraw_library/
 
 # Local caches
 .cache/
+
+# Renderer history (kept locally, not in repo)
+renders/
+render.png
