@@ -25,13 +25,29 @@ Real geometry intersection means parsing primitive geometry in `.dat` files. Big
 ### Coordinate convention
 LDraw: right-handed, **-Y is up**, 1 brick = 20 LDU wide × 24 LDU tall. We don't flip anything for the LLM — every docstring spells it out.
 
+## North star
+
+The ultimate target for this toolchain is **building the Strasbourg Cathedral astronomical clock from its actual plans**, with Claude doing the design work using multimodal input (the plans are images / PDFs). That implies:
+
+- Real LDraw library (the built-in 36 parts is just for "hello, brick" — a serious model needs the full ~20k catalog).
+- Subassemblies via MPD `0 FILE` blocks (the clock has dozens of independent mechanisms — gears, jacquemarts, calendar dial — that must be authored separately and composed).
+- Reference-frame tools so Claude can quote dimensions back to itself across long sessions ("the gothic spire is 12 studs across at the base, 4 at the top").
+- Eventually Technic / gears / non-90° rotations.
+
+None of these change Phase 1 *yet*, but I want the seams to exist:
+
+- LDraw I/O will read multi-block MPD files even though we author flat for now (so we don't lock users out of complex imports).
+- Rotation is a named enum today; switching to a matrix escape hatch is a single tool addition.
+- `place_subassembly` will land as a "stamp this list of parts at this transform" tool before hierarchical editing — gives compositional power without restructuring state.
+
 ## With more time
 
 - Real stud-clutch validation from `.dat` connection geometry.
-- Subassembly / MPD-block authoring tools.
-- `render_model` tool shelling to LDView.
-- Friendly color name → LDraw ID lookup.
+- Hierarchical model state (subassembly tree) replacing the flat list.
+- `render_model` shelling to LDView for photoreal renders (we ship with a built-in AABB renderer).
+- Friendly color name → LDraw ID lookup (already in, ~22 colors).
 - A small agent script (planner / builder / critic) driving Claude against this server.
+- Persistent named projects on disk (not just MPD export).
 
 ## Things to discuss in the walkthrough
 
