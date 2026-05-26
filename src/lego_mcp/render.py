@@ -211,12 +211,17 @@ def render_model_png(
     color_mode: str = "model",
     hidden_edges: bool = True,
     built_set: set[str] | None = None,
+    instance_color_override: dict[str, tuple[int, int, int]] | None = None,
 ) -> bytes:
     """Render the model and return PNG bytes.
 
-    If `built_set` is provided, parts NOT in the set are rendered as 'ghosts'
+    `built_set`: when provided, parts NOT in the set render as ghosts
     (washed-out, no studs) so you can see the target outline plus what's
-    actually been placed. Useful for builder-mode progress views.
+    actually been placed. Used by builder-mode.
+
+    `instance_color_override`: per-part-id RGB override. Takes precedence over
+    `color_mode`. Used by `render_validation` to color parts by their error
+    status (red = collision, orange = floating, etc).
     """
     from lego_mcp.parts import color_rgb
     from lego_mcp.server import part_aabb_world
@@ -297,7 +302,10 @@ def render_model_png(
 
     for ordinal, inst, part, aabb in part_records:
         (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
-        rgb = _debug_rgb(inst, ordinal, color_mode, color_rgb(inst.color))
+        if instance_color_override and inst.instance_id in instance_color_override:
+            rgb = instance_color_override[inst.instance_id]
+        else:
+            rgb = _debug_rgb(inst, ordinal, color_mode, color_rgb(inst.color))
         is_ghost = built_set is not None and inst.instance_id not in built_set
         if is_ghost:
             rgb = _ghost(rgb)

@@ -78,6 +78,8 @@ def test_server_initializes_and_calls_tool():
             # New in this iteration
             "parts_that_mount_on", "restore_autosave", "autosave_status",
             "start_builder_session", "mark_built", "builder_status",
+            # Debug tools
+            "render_validation", "inspect_part", "collision_detail", "describe_errors",
         ]:
             assert required in names, f"tool {required!r} not exposed; got {names}"
 

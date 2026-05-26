@@ -1244,6 +1244,73 @@ def _suggest_for_floating(inst) -> str:
     return f"Place a supporting brick directly below part {inst.instance_id}."
 
 
+# ---------------------------------------------------------------------------
+# Debug / inspection helpers (used by render_validation, inspect_part,
+# collision_detail, describe_errors).
+# ---------------------------------------------------------------------------
+
+def _validation_status_sets() -> dict[str, Any]:
+    """Categorize every part by its validation status. Returns sets keyed by
+    status name plus a `collision_pairs` list for collision_detail.
+
+    Single source of truth so render_validation and inspect_part stay
+    consistent with validate_model.
+    """
+    from lego_mcp.connection_graph import find_floating_and_unanchored
+    parts = STATE.parts
+    aabbs: dict[str, tuple] = {}
+    unknown: set[str] = set()
+    for iid, inst in parts.items():
+        p = PART_INDEX.get(inst.part_id)
+        if p is None:
+            unknown.add(iid)
+            continue
+        aabbs[iid] = part_aabb_world(inst, p)
+
+    # Collisions via the same grid as validate_model
+    grid: dict[tuple[int, int, int], list[str]] = {}
+    for iid, ab in aabbs.items():
+        for key in _cell_keys(ab):
+            grid.setdefault(key, []).append(iid)
+    collisions: set[str] = set()
+    collision_pairs: list[tuple[str, str]] = []
+    checked: set[tuple[str, str]] = set()
+    for ids in grid.values():
+        if len(ids) < 2:
+            continue
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                pair = (a, b) if a < b else (b, a)
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                if aabbs_overlap(aabbs[a], aabbs[b]):
+                    collisions.add(a)
+                    collisions.add(b)
+                    collision_pairs.append(pair)
+
+    _, _, _, floating, unanchored = find_floating_and_unanchored(parts)
+
+    grid_errors: set[str] = set()
+    for inst in parts.values():
+        if not (_grid_aligned(inst.x, _GRID_XZ) and _grid_aligned(inst.z, _GRID_XZ)
+                 and _grid_aligned(inst.y, _GRID_Y)):
+            grid_errors.add(inst.instance_id)
+
+    ok = set(parts.keys()) - collisions - floating - unanchored - grid_errors - unknown
+    return {
+        "ok": ok,
+        "collisions": collisions,
+        "floating": floating,
+        "unanchored": unanchored,
+        "grid_errors": grid_errors,
+        "unknown": unknown,
+        "collision_pairs": collision_pairs,
+        "aabbs": aabbs,
+    }
+
+
 def _resolve_export_path(path: str) -> Path:
     """Honor absolute paths and ~-paths verbatim. Relative paths land in the
     user-writable renders dir so exports work under Claude Desktop where the
@@ -1576,8 +1643,263 @@ try:
         png = latest.read_bytes()
         return [{"ok": True, "path": str(latest), "bytes": len(png)},
                 MCPImage(data=png, format="png")]
+
+    @mcp.tool()
+    def render_validation(width: int = 900, height: int = 700) -> list:
+        """Render with parts color-coded by validation status:
+        - GREEN: ok
+        - RED:    collision
+        - ORANGE: floating (no support)
+        - PURPLE: unanchored (connected island that doesn't reach ground)
+        - YELLOW: off the stud grid
+        - GRAY:   unknown part_id
+
+        Single render shows you exactly where the problems are spatially —
+        much faster than mapping ID lists from validate_model() onto positions.
+        Returns [summary_dict, image] like render_model.
+        """
+        status = _validation_status_sets()
+        STATUS_COLORS = {
+            "ok":          (140, 200, 140),  # green
+            "collision":   (220,  60,  60),  # red
+            "floating":    (245, 165,  55),  # orange
+            "unanchored":  (170,  90, 200),  # purple
+            "grid_error":  (240, 220,  60),  # yellow
+            "unknown":     (130, 130, 130),  # gray
+        }
+        override: dict[str, tuple[int, int, int]] = {}
+        # Precedence: collision > floating > unanchored > grid_error > unknown > ok.
+        # (A part can be in multiple sets — show the most actionable one.)
+        for iid in STATE.parts:
+            if iid in status["collisions"]:
+                override[iid] = STATUS_COLORS["collision"]
+            elif iid in status["floating"]:
+                override[iid] = STATUS_COLORS["floating"]
+            elif iid in status["unanchored"]:
+                override[iid] = STATUS_COLORS["unanchored"]
+            elif iid in status["grid_errors"]:
+                override[iid] = STATUS_COLORS["grid_error"]
+            elif iid in status["unknown"]:
+                override[iid] = STATUS_COLORS["unknown"]
+            else:
+                override[iid] = STATUS_COLORS["ok"]
+        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
+                               hidden_edges=False,
+                               instance_color_override=override)
+        summary, img = _render_to_disk_and_image(png, name_suffix="_validation")
+        summary.update({
+            "parts": len(STATE.parts),
+            "ok": len(status["ok"]),
+            "collisions": len(status["collisions"]),
+            "floating": len(status["floating"]),
+            "unanchored": len(status["unanchored"]),
+            "grid_errors": len(status["grid_errors"]),
+            "unknown": len(status["unknown"]),
+            "legend": {k: f"rgb{v}" for k, v in STATUS_COLORS.items()},
+        })
+        return [summary, img]
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
+
+
+# ---------------------------------------------------------------------------
+# Debug / inspection tools (work without Pillow).
+# ---------------------------------------------------------------------------
+
+def _aabb_intersection(a: tuple, b: tuple) -> tuple | None:
+    """AABB intersection in 3D. Returns ((minx,miny,minz),(maxx,maxy,maxz))
+    or None if no overlap."""
+    (amin, amax), (bmin, bmax) = a, b
+    lo = (max(amin[0], bmin[0]), max(amin[1], bmin[1]), max(amin[2], bmin[2]))
+    hi = (min(amax[0], bmax[0]), min(amax[1], bmax[1]), min(amax[2], bmax[2]))
+    if lo[0] >= hi[0] or lo[1] >= hi[1] or lo[2] >= hi[2]:
+        return None
+    return (lo, hi)
+
+
+def _smallest_separation(a: tuple, b: tuple) -> dict[str, float]:
+    """For two overlapping AABBs, the smallest translation along each axis
+    that would clear the overlap. The LLM picks the cheapest."""
+    inter = _aabb_intersection(a, b)
+    if inter is None:
+        return {}
+    (ilo, ihi) = inter
+    dx = ihi[0] - ilo[0]
+    dy = ihi[1] - ilo[1]
+    dz = ihi[2] - ilo[2]
+    # Direction: positive moves B away from A if B's center is at +x relative to A's, etc.
+    (amin, amax), (bmin, bmax) = a, b
+    a_cx, b_cx = (amin[0] + amax[0]) / 2, (bmin[0] + bmax[0]) / 2
+    a_cz, b_cz = (amin[2] + amax[2]) / 2, (bmin[2] + bmax[2]) / 2
+    a_cy, b_cy = (amin[1] + amax[1]) / 2, (bmin[1] + bmax[1]) / 2
+    return {
+        "move_x": dx if b_cx >= a_cx else -dx,
+        "move_y": dy if b_cy >= a_cy else -dy,
+        "move_z": dz if b_cz >= a_cz else -dz,
+    }
+
+
+@mcp.tool()
+def inspect_part(instance_id: str, neighbor_studs: int = 2) -> dict[str, Any]:
+    """Focused diagnostic for ONE part: position, AABB, neighbors,
+    supporters/supported, collisions, and validation status flags. Cuts
+    debugging from 'find ID in list_parts dump' to one call.
+
+    `neighbor_studs`: include parts within this many studs in XZ (default 2).
+    """
+    inst = STATE.parts.get(instance_id)
+    if inst is None:
+        raise ValueError(f"No part with instance_id={instance_id!r}")
+    p = PART_INDEX.get(inst.part_id)
+    aabb = part_aabb_world(inst, p) if p else None
+    status = _validation_status_sets()
+    flags = []
+    if instance_id in status["collisions"]: flags.append("collision")
+    if instance_id in status["floating"]: flags.append("floating")
+    if instance_id in status["unanchored"]: flags.append("unanchored")
+    if instance_id in status["grid_errors"]: flags.append("grid_misalignment")
+    if instance_id in status["unknown"]: flags.append("unknown_part")
+    if not flags: flags.append("ok")
+
+    # Collisions this part is involved in
+    collides_with: list[dict[str, Any]] = []
+    for (a, b) in status["collision_pairs"]:
+        if a == instance_id or b == instance_id:
+            other = b if a == instance_id else a
+            other_inst = STATE.parts.get(other)
+            other_aabb = status["aabbs"].get(other)
+            if other_inst is None or other_aabb is None or aabb is None:
+                continue
+            inter = _aabb_intersection(aabb, other_aabb)
+            sep = _smallest_separation(aabb, other_aabb)
+            collides_with.append({
+                "other": other, "other_part_id": other_inst.part_id,
+                "other_position": [other_inst.x, other_inst.y, other_inst.z],
+                "overlap_region": ({"min": list(inter[0]), "max": list(inter[1])}
+                                   if inter else None),
+                "smallest_separation_ldu": sep,
+            })
+
+    # Neighbors via the connection graph (parts mating with this one)
+    from lego_mcp.connection_graph import build_graph
+    graph, _edges = build_graph(STATE.parts)
+    neighbors_connected = sorted(graph.get(instance_id, set()))
+
+    # Spatial neighbors within `neighbor_studs` in XZ (using AABB)
+    nearby: list[str] = []
+    if aabb is not None:
+        radius = neighbor_studs * 20.0
+        (axmin, _, azmin), (axmax, _, azmax) = aabb
+        for other_id, other in STATE.parts.items():
+            if other_id == instance_id:
+                continue
+            op = PART_INDEX.get(other.part_id)
+            if op is None:
+                continue
+            o_ab = status["aabbs"].get(other_id)
+            if o_ab is None:
+                continue
+            (oxmin, _, ozmin), (oxmax, _, ozmax) = o_ab
+            # Expand our AABB by radius and test overlap in XZ
+            if (axmin - radius < oxmax and axmax + radius > oxmin and
+                    azmin - radius < ozmax and azmax + radius > ozmin):
+                nearby.append(other_id)
+
+    return {
+        "instance_id": instance_id,
+        "part_id": inst.part_id,
+        "part_name": p.name.strip() if p else None,
+        "position": [inst.x, inst.y, inst.z],
+        "rotation": inst.rotation,
+        "subassembly": inst.subassembly,
+        "color": inst.color,
+        "aabb_world": ({"min": list(aabb[0]), "max": list(aabb[1])}
+                        if aabb else None),
+        "validation": flags,
+        "connected_to": neighbors_connected,
+        "collides_with": collides_with,
+        "nearby_within_studs": {"radius_studs": neighbor_studs,
+                                 "count": len(nearby),
+                                 "ids": nearby[:20]},
+    }
+
+
+@mcp.tool()
+def collision_detail(part_a: str, part_b: str) -> dict[str, Any]:
+    """For two parts known to collide, return overlap region (AABB intersection),
+    overlap volume in LDU³, and the smallest translation along each axis that
+    would separate them. The LLM picks the cheapest axis."""
+    a_inst = STATE.parts.get(part_a)
+    b_inst = STATE.parts.get(part_b)
+    if a_inst is None or b_inst is None:
+        raise ValueError(f"Need two existing instance ids; got {part_a!r}, {part_b!r}")
+    a_p = PART_INDEX.get(a_inst.part_id)
+    b_p = PART_INDEX.get(b_inst.part_id)
+    if a_p is None or b_p is None:
+        raise ValueError("Unknown part definition for one of the instances")
+    a_aabb = part_aabb_world(a_inst, a_p)
+    b_aabb = part_aabb_world(b_inst, b_p)
+    inter = _aabb_intersection(a_aabb, b_aabb)
+    if inter is None:
+        return {"ok": True, "collides": False,
+                "message": f"{part_a} and {part_b} do not overlap (AABB-clear)."}
+    lo, hi = inter
+    volume = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2])
+    sep = _smallest_separation(a_aabb, b_aabb)
+    return {
+        "ok": True,
+        "collides": True,
+        "part_a": {"id": part_a, "part_id": a_inst.part_id,
+                   "position": [a_inst.x, a_inst.y, a_inst.z]},
+        "part_b": {"id": part_b, "part_id": b_inst.part_id,
+                   "position": [b_inst.x, b_inst.y, b_inst.z]},
+        "overlap_region": {"min": list(lo), "max": list(hi)},
+        "overlap_volume_ldu3": round(volume, 2),
+        "smallest_separation_ldu": sep,
+        "suggestion": _format_separation_suggestion(part_b, sep),
+    }
+
+
+def _format_separation_suggestion(part_id: str, sep: dict[str, float]) -> str:
+    if not sep:
+        return "Parts do not overlap."
+    # Pick the axis with the smallest absolute move
+    best_axis, best_move = min(sep.items(), key=lambda kv: abs(kv[1]))
+    axis = best_axis.replace("move_", "")
+    return f"Move {part_id} by {best_move:+g} LDU on {axis.upper()} to clear (cheapest axis)."
+
+
+@mcp.tool()
+def describe_errors(max_errors: int = 10) -> dict[str, Any]:
+    """Walk validate_model()'s errors and return a richer per-error report:
+    positions, overlap regions for collisions, suggested fixes. Saves the LLM
+    from having to round-trip inspect_part / collision_detail per error."""
+    val = validate_model(max_errors=max_errors)
+    detailed: list[dict[str, Any]] = []
+    for err in val["errors"][:max_errors]:
+        t = err["type"]
+        if t == "collision":
+            try:
+                cd = collision_detail(err["instance_a"], err["instance_b"])
+                detailed.append({"type": t, **cd})
+            except ValueError as e:
+                detailed.append({"type": t, "error": str(e), **err})
+        elif t in ("floating_part", "unanchored", "invalid_grid_alignment", "unknown_part"):
+            iid = err.get("instanceId") or err.get("instance_id")
+            try:
+                detail = inspect_part(iid, neighbor_studs=2)
+                detailed.append({"type": t, "inspect": detail,
+                                  "suggestion": err.get("suggestion")})
+            except ValueError as e:
+                detailed.append({"type": t, "error": str(e), **err})
+        else:
+            detailed.append(err)
+    return {
+        "summary": val["summary"],
+        "error_count": len(val["errors"]),
+        "described": len(detailed),
+        "errors": detailed,
+    }
 
 
 # ---------------------------------------------------------------------------
