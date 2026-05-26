@@ -248,17 +248,80 @@ def _parse_dat(path: Path) -> tuple[str, list[tuple[str, str, tuple[float, ...]]
     return name, type1_refs, prim_vertices
 
 
+def _collect_vertices(filename: str, transform: tuple[float, ...], ldraw_home: Path,
+                      visited: set[str], max_depth: int = 3, depth: int = 0,
+                      ) -> list[tuple[float, float, float]]:
+    """Recursively gather all primitive vertices in part-local coords.
+
+    For each type-1 reference into the s/ subdir, recurse with the composed
+    transform. Cycles guarded by visited set + depth limit.
+    """
+    if depth > max_depth or filename in visited:
+        return []
+    visited.add(filename)
+    parts_dir = ldraw_home / "parts"
+    s_dir = parts_dir / "s"
+    path = parts_dir / filename
+    if not path.is_file():
+        path = s_dir / Path(filename).name
+    if not path.is_file():
+        return []
+    parsed = _parse_dat(path)
+    if not parsed:
+        return []
+    _, refs, prim_vertices = parsed
+
+    out: list[tuple[float, float, float]] = []
+    # Transform local primitives.
+    for vx, vy, vz in prim_vertices:
+        nx = transform[0] + transform[3]*vx + transform[4]*vy + transform[5]*vz
+        ny = transform[1] + transform[6]*vx + transform[7]*vy + transform[8]*vz
+        nz = transform[2] + transform[9]*vx + transform[10]*vy + transform[11]*vz
+        out.append((nx, ny, nz))
+    # Recurse into subparts.
+    for fname, _color, values in refs:
+        base = Path(fname).name
+        if base in _STUD_FILES:
+            continue  # studs handled separately
+        # Recurse if filename looks like a subpart (in s/) or any internal ref.
+        composed = (
+            transform[0] + transform[3]*values[0] + transform[4]*values[1] + transform[5]*values[2],
+            transform[1] + transform[6]*values[0] + transform[7]*values[1] + transform[8]*values[2],
+            transform[2] + transform[9]*values[0] + transform[10]*values[1] + transform[11]*values[2],
+            transform[3]*values[3] + transform[4]*values[6] + transform[5]*values[9],
+            transform[3]*values[4] + transform[4]*values[7] + transform[5]*values[10],
+            transform[3]*values[5] + transform[4]*values[8] + transform[5]*values[11],
+            transform[6]*values[3] + transform[7]*values[6] + transform[8]*values[9],
+            transform[6]*values[4] + transform[7]*values[7] + transform[8]*values[10],
+            transform[6]*values[5] + transform[7]*values[8] + transform[8]*values[11],
+            transform[9]*values[3] + transform[10]*values[6] + transform[11]*values[9],
+            transform[9]*values[4] + transform[10]*values[7] + transform[11]*values[10],
+            transform[9]*values[5] + transform[10]*values[8] + transform[11]*values[11],
+        )
+        out.extend(_collect_vertices(fname, composed, ldraw_home, visited, max_depth, depth + 1))
+    return out
+
+
 def _parse_dat_header(path: Path) -> tuple[str, tuple[float, float, float, float, float, float]] | None:
-    """Read a .dat file's description and compute an AABB from its primitive vertices."""
+    """Read a .dat file's description and compute its AABB, recursing into subparts.
+
+    Many LDraw parts have most of their geometry in a subpart file under s/.
+    Without recursion, the parent's AABB is tiny (just the bits drawn at the
+    top level). The recursive walk handles common 1-2 level nesting.
+    """
     parsed = _parse_dat(path)
     if not parsed:
         return None
-    name, _, prim_vertices = parsed
-    if not prim_vertices:
+    name, _, _ = parsed
+    # Walk recursively from this file with identity transform.
+    identity = (0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
+    ldraw_home = path.parent.parent if path.parent.name == "parts" else path.parent.parent.parent
+    vertices = _collect_vertices(path.name, identity, ldraw_home, visited=set())
+    if not vertices:
         return None
-    xs = [v[0] for v in prim_vertices]
-    ys = [v[1] for v in prim_vertices]
-    zs = [v[2] for v in prim_vertices]
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    zs = [v[2] for v in vertices]
     return name, (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
 
 
@@ -283,31 +346,33 @@ def _matmul(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, ...]:
     return (nx, ny, nz) + nm
 
 
-def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 3
+def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 5
                    ) -> list[tuple[float, float, float]]:
     """Recursively scan a part for TOP stud positions in part-local coords.
 
-    A stud reference is any type-1 line whose filename is in _STUD_FILES.
-    We keep only studs whose orientation matrix has its Y axis pointing in the
-    -Y direction (i.e. e[1][1] > 0 — the standard 'stud points up' matrix).
-    Anti-studs (bottom connectors, with e[1][1] < 0) are skipped.
-
-    Subfile refs into the s/ directory are recursed up to max_depth levels.
+    Recurses through subparts in s/ AND stud-group primitives in p/ (like
+    stug-2x2.dat which holds 4 stud.dat refs). Only keeps studs whose
+    orientation matrix has e[1][1] > 0 (stud points up in -Y direction).
+    Anti-studs (bottom connectors, e[1][1] < 0) are skipped.
     """
     parts_dir = ldraw_home / "parts"
     s_dir = parts_dir / "s"
-    visited: set[str] = set()
+    p_dir = ldraw_home / "p"
     out: list[tuple[float, float, float]] = []
 
     def walk(filename: str, transform: tuple[float, ...], depth: int) -> None:
-        if depth > max_depth or filename in visited:
+        # No visited-set dedup: the same primitive (e.g. stug-2x2) can legitimately
+        # be referenced from many positions in one part (a baseplate uses one stud
+        # group per 2x2 cluster). max_depth bounds runaway recursion.
+        if depth > max_depth:
             return
-        visited.add(filename)
-        # Resolve file path: try parts/<name>, then parts/s/<basename>.
+        # Resolve: try parts/, parts/s/, then p/ (for stud-group primitives).
+        base = Path(filename).name
         path = parts_dir / filename
         if not path.is_file():
-            base = Path(filename).name
             path = s_dir / base
+        if not path.is_file():
+            path = p_dir / base
         if not path.is_file():
             return
         parsed = _parse_dat(path)
@@ -317,24 +382,14 @@ def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 3
         for fname, _color, values in refs:
             base = Path(fname).name
             if base in _STUD_FILES:
-                # Compose with the current transform to get world-local stud position.
                 composed = _matmul(transform, values)
-                # composed[0..2] = position, composed[3..11] = matrix.
-                # The stud's local Y axis transformed = (composed[4], composed[7], ?? wait
-                # we want the y-direction of the stud's local frame in part-local coords.
-                # Stud's local +Y axis = matrix column 1 = (matrix[1], matrix[4], matrix[7]).
-                # But "stud points up" means its local +Y maps to -Y in part frame.
-                # The standard stud has its cylinder along +Y in its local frame, with
-                # the tube emerging from y=0 toward y=-4 (so y_local component matters).
-                # We use e[1][1] (composed[7]) as the proxy: if > 0, the stud's local +Y
-                # has a positive +Y component in part frame -> points DOWN -> top stud.
-                # If <= 0, it points UP in part frame -> bottom anti-stud, skip.
-                e11 = composed[7]
-                if e11 > 0:
+                # e[1][1] = composed[7]. > 0 means stud points DOWN in part
+                # frame (+Y), which is UP in LDraw's -Y-is-up convention -> top stud.
+                if composed[7] > 0:
                     out.append((composed[0], composed[1], composed[2]))
-            elif depth < max_depth and ("/" in fname or fname.startswith("s\\") or
-                                         (s_dir / Path(fname).name).is_file()):
-                # Recurse into subpart with composed transform.
+            else:
+                # Always recurse — could be a subpart (s/), a stud-group
+                # primitive (p/stug-NxN.dat), or any other internal file.
                 composed = _matmul(transform, values)
                 walk(fname, composed, depth + 1)
 

@@ -105,36 +105,29 @@ def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
                height_rows: int = 5,
                color: str | int = "light_bluish_gray",
                bond: str = "running",
-               base_y: float = -1,
+               base_y: float = -4,
                brick_part: str = "3001",
-               corner_part: str = "3003",
                ) -> dict[str, Any]:
     """Build a rectangular hollow room: 4 walls + 2x2 corner stacks.
 
-    Walls use `build_wall` with inset ends; 2x2 corner blocks (3003) fill the
-    gap at each corner so the AABB perimeter is closed.
+    The 4 walls are inset 20 LDU at each end; 2x2 corner blocks (3003) fill
+    each corner so the AABB perimeter is closed and stays inside the
+    (x_min, x_max) x (z_min, z_max) boundary.
 
-    LIMITATION: the corner blocks form vertical columns that don't side-bond
-    into the perpendicular walls — they're connected to the corner block
-    below/above only. Real LEGO masonry alternates the corner: row 0 has the
-    X-wall extending into the corner; row 1 has the Z-wall doing so. This
-    helper doesn't yet do that alternating bond. For a structurally-correct
-    cathedral corner you currently need to place the corner pieces manually,
-    alternating their rotation per row. (Tracked in NOTES.md.)
+    LIMITATION — this is NOT real LEGO masonry corner bonding. The corner
+    blocks form vertical columns that bond up/down to themselves but only
+    SIT NEXT TO the perpendicular walls, they don't interlock with them.
+    Real bonded corners need bricks that span the corner per row, alternating
+    direction (even rows wrap one way, odd rows the other). Generic helper
+    can't safely do this without protruding past the boundary, so we ship
+    the simple version. For a structurally-bonded corner the LLM/user should
+    place corner pieces manually with `add_part` per row.
 
     Defaults assume the room sits on a baseplate at y=0 (top y=-1).
     """
     s = _server()
-    wall_thickness = 40  # one 2x4 brick rotated short-side
-    inset = wall_thickness / 2
-
-    # 2x4 corner bricks alternate rotation per row, so on even rows they extend
-    # 80 LDU into the X walls and on odd rows 80 LDU into the Z walls. The
-    # walls inset 40 LDU on each end to leave room for the corner brick's
-    # protrusion — creating an interlocked bond instead of stand-alone corner
-    # columns.
-    corner_long_half = 40   # half of the corner brick's long dimension
-    inset = corner_long_half
+    wall_thickness = 40
+    inset = wall_thickness / 2  # 20 LDU = half the wall thickness
 
     wall_results = [
         build_wall(x_min, z_min, x_max, z_min, height_rows, color, bond,
@@ -154,14 +147,12 @@ def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
     for (cx, cz) in corners:
         for row in range(height_rows):
             y = base_y - row * BRICK_H
-            # Alternate the long axis per row so the corner brick wraps into
-            # alternating walls — real masonry corner bond.
-            rotation = "identity" if row % 2 == 0 else "rot90y"
-            s.add_part("3001", color, cx, y, cz, rotation=rotation)
+            s.add_part("3003", color, cx, y, cz)  # 2x2 corner brick
             corner_count += 1
 
     return {"ok": True, "wall_bricks": wall_bricks, "corner_bricks": corner_count,
-            "subassembly": s.STATE.current_subassembly}
+            "subassembly": s.STATE.current_subassembly,
+            "warning": "Corner columns don't bond into walls — see helper docstring."}
 
 
 def build_floor(x_min: float, z_min: float, x_max: float, z_max: float,
