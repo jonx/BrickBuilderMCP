@@ -17,6 +17,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
@@ -98,6 +99,7 @@ class ModelState:
     parts: dict[str, PartInstance] = field(default_factory=dict)
     _next_id: int = 1
     current_subassembly: str = "main"
+    notes: dict[str, str] = field(default_factory=dict)
     # Op-based undo/redo: O(1) per mutation regardless of model size.
     _undo: list[Op] = field(default_factory=list)
     _redo: list[Op] = field(default_factory=list)
@@ -409,6 +411,7 @@ def _reset_state(name: str, keep_checkpoints: bool = False) -> None:
     STATE.parts.clear()
     STATE._next_id = 1
     STATE.current_subassembly = "main"
+    STATE.notes.clear()
     STATE._undo.clear()
     STATE._redo.clear()
     if not keep_checkpoints:
@@ -821,6 +824,110 @@ def restore_checkpoint(name: str) -> dict[str, Any]:
 def list_checkpoints() -> dict[str, Any]:
     """Names of all checkpoints saved this session."""
     return {"checkpoints": [{"name": n, "parts": len(s.parts)} for n, s in STATE._checkpoints.items()]}
+
+
+# ---------------------------------------------------------------------------
+# Persistent named projects on disk (survive restart).
+# ---------------------------------------------------------------------------
+
+PROJECTS_DIR = Path(os.environ.get(
+    "LEGO_MCP_PROJECTS",
+    str(Path.home() / "Library" / "Application Support" / "lego_mcp" / "projects"),
+))
+
+
+def _project_paths(name: str) -> tuple[Path, Path]:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "untitled"
+    base = PROJECTS_DIR / safe
+    return base.with_suffix(".mpd"), base.with_suffix(".notes.json")
+
+
+@mcp.tool()
+def save_project(name: str) -> dict[str, Any]:
+    """Save the current model (parts + notes) to disk under `name`.
+
+    The model is written as a multi-block MPD; notes go alongside as JSON.
+    Survives restart. Use `list_projects()` to see them, `load_project(name)`
+    to restore.
+    """
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    mpd_path, notes_path = _project_paths(name)
+    mpd_path.write_text(emit_mpd(STATE))
+    notes_path.write_text(json.dumps({"name": STATE.name, "notes": STATE.notes}))
+    return {"ok": True, "name": name, "mpd": str(mpd_path), "notes": str(notes_path),
+            "parts": len(STATE.parts)}
+
+
+@mcp.tool()
+def load_project(name: str) -> dict[str, Any]:
+    """Replace the current model with a saved project (parts + notes)."""
+    mpd_path, notes_path = _project_paths(name)
+    if not mpd_path.is_file():
+        raise ValueError(f"No project {name!r} at {mpd_path}")
+    instances = parse_ldr_text(mpd_path.read_text())
+    _reset_state(name)
+    for inst in instances:
+        inst.instance_id = STATE.new_id()
+        STATE.parts[inst.instance_id] = inst
+    if notes_path.is_file():
+        try:
+            data = json.loads(notes_path.read_text())
+            STATE.name = data.get("name", name)
+            STATE.notes.update(data.get("notes", {}))
+        except (OSError, ValueError):
+            pass
+    return {"ok": True, "name": name, "parts": len(STATE.parts),
+            "notes": len(STATE.notes)}
+
+
+@mcp.tool()
+def list_projects() -> dict[str, Any]:
+    """List every saved project on disk."""
+    if not PROJECTS_DIR.is_dir():
+        return {"projects": []}
+    projects = []
+    for f in sorted(PROJECTS_DIR.glob("*.mpd")):
+        projects.append({"name": f.stem, "path": str(f),
+                         "size_bytes": f.stat().st_size})
+    return {"projects": projects, "dir": str(PROJECTS_DIR)}
+
+
+# ---------------------------------------------------------------------------
+# Reference notes (sticky observations for multimodal workflows: a user
+# uploads architectural plans, Claude estimates "left tower is 12 studs at
+# base, narrows to 6", and saves a note. Notes persist with the project.)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def add_note(key: str, text: str) -> dict[str, Any]:
+    """Record a free-text observation under `key`. Overwrites if key exists.
+
+    Useful for tracking dimensions/proportions/decisions across many turns
+    when building from reference imagery.
+    """
+    STATE.notes[key] = text
+    return {"ok": True, "key": key, "total_notes": len(STATE.notes)}
+
+
+@mcp.tool()
+def get_note(key: str) -> dict[str, Any]:
+    """Read a previously-saved note."""
+    if key not in STATE.notes:
+        raise ValueError(f"No note {key!r}. Saved: {sorted(STATE.notes)}")
+    return {"key": key, "text": STATE.notes[key]}
+
+
+@mcp.tool()
+def list_notes() -> dict[str, Any]:
+    """All saved notes for the current model."""
+    return {"notes": [{"key": k, "text": v} for k, v in STATE.notes.items()]}
+
+
+@mcp.tool()
+def remove_note(key: str) -> dict[str, Any]:
+    """Delete a note."""
+    STATE.notes.pop(key, None)
+    return {"ok": True, "key": key, "remaining": len(STATE.notes)}
 
 
 # render_model is registered when render.py imports cleanly (Pillow present).
