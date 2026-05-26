@@ -76,3 +76,43 @@ def test_view_latest_render_without_prior_render(tmp_path, monkeypatch):
     result = server.view_latest_render()
     assert isinstance(result, list)
     assert result[0]["ok"] is False
+
+
+def test_inline_mode_file_url_uses_file_link(tmp_path, monkeypatch):
+    """LEGO_MCP_INLINE_MODE=file_url shrinks the markdown to a file:// link."""
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
+    monkeypatch.setenv("LEGO_MCP_INLINE_MODE", "file_url")
+    server.create_model()
+    server.add_part("3001", "red", 0, 0, 0)
+    result = server.render_model(200, 150)
+    assert len(result) == 3
+    markdown, summary, _img = result
+    assert markdown.startswith("![")
+    assert "file://" in markdown
+    assert "data:image/png;base64," not in markdown
+    # Bytes savings: a file:// markdown is ~ path-length, not base64-of-png.
+    assert len(markdown) < 500
+
+
+def test_inline_mode_none_skips_markdown(tmp_path, monkeypatch):
+    """LEGO_MCP_INLINE_MODE=none returns [summary, MCPImage] only — no markdown text."""
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
+    monkeypatch.setenv("LEGO_MCP_INLINE_MODE", "none")
+    server.create_model()
+    server.add_part("3001", "red", 0, 0, 0)
+    result = server.render_model(200, 150)
+    assert len(result) == 2, "no markdown block expected in 'none' mode"
+    summary, img = result
+    assert isinstance(summary, dict)
+    assert isinstance(img, MCPImage)
+
+
+def test_inline_mode_default_is_data_uri(tmp_path, monkeypatch):
+    """Unset env var → default 'data_uri' mode (the verified-working baseline)."""
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
+    monkeypatch.delenv("LEGO_MCP_INLINE_MODE", raising=False)
+    server.create_model()
+    server.add_part("3001", "red", 0, 0, 0)
+    result = server.render_model(200, 150)
+    markdown, _summary, _img = result
+    assert "data:image/png;base64," in markdown

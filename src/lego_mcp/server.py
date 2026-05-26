@@ -1592,21 +1592,46 @@ try:
                    "bytes": len(png)}
         return summary, MCPImage(data=png, format="png")
 
-    def _markdown_image(png: bytes, alt: str = "render") -> str:
-        """Build a markdown image-data-URI block. Claude Desktop renders this
-        inline in the chat UI (confirmed). The MCPImage block stays as well
-        so the LLM still gets the image as proper vision content."""
+    def _inline_mode() -> str:
+        """data_uri (default, works in any chat client) / file_url (tiny, only
+        works where the client renders local file links — Claude Desktop has
+        been observed to) / none (skip the markdown text entirely, just rely
+        on the MCPImage block).
+
+        Read fresh on every render so the user can flip modes mid-session via
+        `export LEGO_MCP_INLINE_MODE=file_url` and a tool restart.
+        """
+        return os.environ.get("LEGO_MCP_INLINE_MODE", "data_uri").strip().lower()
+
+    def _markdown_image(png: bytes, file_path: str, alt: str = "render") -> str | None:
+        """Markdown text-block image. Mode-dependent (see _inline_mode)."""
+        mode = _inline_mode()
+        if mode == "none":
+            return None
+        if mode == "file_url":
+            # file:// scheme. Path must be absolute (it always is here — we
+            # write under the resolved renders dir).
+            return f"![{alt}](file://{file_path})"
+        # default: data_uri
         import base64
         b64 = base64.b64encode(png).decode("ascii")
         return f"![{alt}](data:image/png;base64,{b64})"
 
     def _render_response(png: bytes, summary: dict[str, Any], alt: str = "render") -> list:
-        """Standard response: [markdown-inline-image, summary_dict, MCPImage].
-        Markdown so the human sees it inline in chat; MCPImage so the LLM
-        sees it as proper vision content for reasoning."""
-        return [_markdown_image(png, alt),
-                summary,
-                MCPImage(data=png, format="png")]
+        """Standard response: [markdown-inline-image?, summary_dict, MCPImage].
+
+        The MCPImage block is ALWAYS present — that's what the LLM's vision
+        channel sees. The leading markdown text is for the human's chat-UI
+        inline preview and may be omitted (mode='none') or use a file:// URL
+        to save bytes (mode='file_url').
+        """
+        blocks: list = []
+        md = _markdown_image(png, summary.get("path", ""), alt)
+        if md is not None:
+            blocks.append(md)
+        blocks.append(summary)
+        blocks.append(MCPImage(data=png, format="png"))
+        return blocks
 
     @mcp.tool()
     def render_model(width: int = 800, height: int = 600,
