@@ -2,6 +2,8 @@
 
 An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **buildable** LEGO models by emitting validated LDraw files — not by clicking around in a CAD app.
 
+![A small bonded room on a baseplate, rendered by LegoMCP's built-in isometric renderer](docs/images/hero.png)
+
 Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets ~50 semantic tools, 6 prompts, and 4 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
 > **Status**: alpha but functional end-to-end. **128 tests passing.** Verified working under Claude Desktop with inline image rendering in chat.
@@ -157,6 +159,10 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 These encode real LEGO masonry/architecture techniques so the LLM doesn't have to compute stagger/corners/seams by hand. Strict-grid by default; reject off-grid coords.
 
+![A 6-row red wall with running-bond stagger on a gray baseplate](docs/images/running_bond.png)
+
+*`build_wall_segment(..., bond="running")` — each row's seams shift by half a brick from the row below.*
+
 | Tool | What it does |
 |---|---|
 | `build_wall_segment(x0, z0, x1, z1, height_rows, color, bond, base_y, palette)` | Straight wall with `running` / `stretcher` / `stack` bond. End-fills with shorter bricks; tracks seams so adjacent rows don't share them. |
@@ -220,6 +226,10 @@ All four return `[markdown_preview, summary_dict, MCPImage]` — the human sees 
 | `render_validation(width=900, height=700)` | Color-codes each part by validation status: **green** = ok, **red** = collision, **orange** = floating, **purple** = unanchored, **yellow** = off-grid, **gray** = unknown part_id. The one-shot "where are my problems?" view. |
 | `view_latest_render()` | Re-show the most recent render without re-rendering. |
 
+![render_validation: green baseplate and grounded bricks, orange floating brick, and a red collision pair](docs/images/validation.png)
+
+*`render_validation()` on a deliberately-broken scene: green baseplate + correctly-grounded bricks, the red 1-pixel sliver between the two yellow-orange bricks is a collision pair, the standalone orange brick on the right is floating.*
+
 ### Persistence: checkpoints / projects / autosave
 
 Three tiers — pick the right one:
@@ -233,6 +243,10 @@ Three tiers — pick the right one:
 ### Builder mode
 
 Walk a finished target model piece by piece (for a human or robot to physically assemble).
+
+![render_progress: bottom rows of the target room placed (solid red), upper rows still ghosted (pink)](docs/images/progress.png)
+
+*`render_progress()` mid-build: the bottom row of the target room is placed (solid red), the rest of the target shows as faded ghosts so you know what's still to come.*
 
 | Tool | What it does |
 |---|---|
