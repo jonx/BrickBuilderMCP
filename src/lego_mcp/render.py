@@ -127,43 +127,14 @@ def render_model_png(
     off_x = margin - min(pxs) * scale + (width - 2 * margin - src_w * scale) / 2
     off_y = margin - min(pys) * scale + (height - 2 * margin - src_h * scale) / 2
 
-    def _to_screen(x: float, y: float, z: float) -> tuple[float, float]:
-        sx, sy = _project(x, y, z)
-        return sx * scale + off_x, sy * scale + off_y
-
-    # Pass 1: draw all sub-faces farthest-first.
-    # Outline each sub-face in its own fill color so Pillow's rasterizer doesn't
-    # leave 1-pixel seams between adjacent subdivisions.
+    # Draw all sub-faces farthest-first. Outline each sub-face in its own fill
+    # color so Pillow's rasterizer doesn't leave 1-pixel seams between adjacent
+    # subdivisions. Three shading levels (top/right/front) give the brick-face
+    # look without explicit outlines, which would overdraw through occlusion.
     faces.sort(key=lambda f: f[0])
     for _, screen, fill, _outline in faces:
         poly = [(sx * scale + off_x, sy * scale + off_y) for sx, sy in screen]
         draw.polygon(poly, fill=fill, outline=fill)
-
-    # Pass 2: outline each part's silhouette on top, so edges read clearly.
-    # We outline the 9 visible edges of each part's AABB. Outlines drawn on top
-    # will sometimes appear over occluding parts — visually fine for LEGO style.
-    edge_color = (40, 40, 40)
-    for inst in parts.values():
-        part = index.get(inst.part_id)
-        if part is None:
-            continue
-        (xmin, ymin, zmin), (xmax, ymax, zmax) = part_aabb_world(inst, part)
-        edges = [
-            # Top face perimeter
-            ((xmin, ymin, zmin), (xmax, ymin, zmin)),
-            ((xmax, ymin, zmin), (xmax, ymin, zmax)),
-            ((xmax, ymin, zmax), (xmin, ymin, zmax)),
-            ((xmin, ymin, zmax), (xmin, ymin, zmin)),
-            # Verticals on the visible side
-            ((xmax, ymin, zmin), (xmax, ymax, zmin)),
-            ((xmax, ymin, zmax), (xmax, ymax, zmax)),
-            ((xmin, ymin, zmax), (xmin, ymax, zmax)),
-            # Bottom-front and bottom-right
-            ((xmax, ymax, zmin), (xmax, ymax, zmax)),
-            ((xmin, ymax, zmax), (xmax, ymax, zmax)),
-        ]
-        for p0, p1 in edges:
-            draw.line([_to_screen(*p0), _to_screen(*p1)], fill=edge_color, width=1)
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
