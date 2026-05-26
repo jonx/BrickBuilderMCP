@@ -73,6 +73,13 @@ def test_server_initializes_and_calls_tool():
         ]:
             assert required in names, f"tool {required!r} not exposed; got {names}"
 
+        # 3b. list prompts — verify our build/from_plans/etc. templates are exposed
+        _send(proc, {"jsonrpc": "2.0", "id": 25, "method": "prompts/list"})
+        resp = _read_until(proc, 25)
+        prompt_names = {p["name"] for p in resp["result"]["prompts"]}
+        for expected in ("build", "from_plans", "from_image", "rescue", "techniques"):
+            assert expected in prompt_names, f"prompt {expected!r} missing; got {prompt_names}"
+
         # 4. create_model + add_part — verify a real round-trip call works
         _send(proc, {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
