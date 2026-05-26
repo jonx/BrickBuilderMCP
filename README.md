@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **buildable** LEGO models by emitting validated LDraw files — not by clicking around in a CAD app.
 
-![A small bonded room on a baseplate, rendered by LegoMCP's built-in isometric renderer](docs/images/hero.png)
+![A colorful bonded room on a tan baseplate, each brick a distinct color to show the running-bond stagger and 2x2 corner columns](docs/images/bonded_room.png)
 
 Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets ~50 semantic tools, 6 prompts, and 4 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
@@ -226,9 +226,9 @@ All four return `[markdown_preview, summary_dict, MCPImage]` — the human sees 
 | `render_validation(width=900, height=700)` | Color-codes each part by validation status: **green** = ok, **red** = collision, **orange** = floating, **purple** = unanchored, **yellow** = off-grid, **gray** = unknown part_id. The one-shot "where are my problems?" view. |
 | `view_latest_render()` | Re-show the most recent render without re-rendering. |
 
-![render_validation: green baseplate and grounded bricks, orange floating brick, and a red collision pair](docs/images/validation.png)
+![render_validation on a clean build: every part rendered green, indicating no collisions, no floating parts, and proper grid alignment](docs/images/validation.png)
 
-*`render_validation()` on a deliberately-broken scene: green baseplate + correctly-grounded bricks, the red 1-pixel sliver between the two yellow-orange bricks is a collision pair, the standalone orange brick on the right is floating.*
+*`render_validation()` on a clean `build_room`: every part is green — no collisions, nothing floating, nothing off-grid. When something is wrong, the offending parts switch color (**red** = collision, **orange** = floating, **purple** = unanchored, **yellow** = off-grid, **gray** = unknown part_id) so you can spot problems at a glance.*
 
 ### Persistence: checkpoints / projects / autosave
 
