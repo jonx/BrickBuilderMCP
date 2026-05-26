@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import urllib.request
 import zipfile
@@ -157,12 +158,19 @@ CACHE_FILE = Path.home() / ".cache" / "lego_mcp" / "parts_index.json"
 
 
 def install_library(target: Path | None = None) -> Path:
-    """Download and unpack the full LDraw library."""
+    """Download and unpack the full LDraw library (~85 MB)."""
     dest = target or LDRAW_HOME
     dest.mkdir(parents=True, exist_ok=True)
     zip_path = dest.parent / "ldraw_complete.zip"
-    print(f"Downloading LDraw library to {zip_path} ({LDRAW_URL})...")
-    with urllib.request.urlopen(LDRAW_URL) as resp, open(zip_path, "wb") as out:
+    print(f"Downloading LDraw library to {zip_path}\n  from {LDRAW_URL}\n  ...")
+    # library.ldraw.org blocks the default urllib User-Agent.
+    req = urllib.request.Request(LDRAW_URL, headers={
+        "User-Agent": "LegoMCP/0.1 (+https://github.com/jknipper/LegoMCP)",
+    })
+    with urllib.request.urlopen(req) as resp, open(zip_path, "wb") as out:
+        total = resp.headers.get("Content-Length")
+        if total:
+            print(f"  download size: {int(total) / 1024 / 1024:.1f} MB")
         shutil.copyfileobj(resp, out)
     print(f"Unpacking into {dest}...")
     with zipfile.ZipFile(zip_path) as zf:
@@ -272,12 +280,35 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
     return index
 
 
+_SIZE_RE = re.compile(r"(\d+)\s*[x×]\s*(\d+)(?:\s*[x×]\s*(\d+))?")
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, collapse whitespace, and rewrite 'N x N' / 'NxN' to a single 'NxN'."""
+    s = text.lower()
+    s = _SIZE_RE.sub(
+        lambda m: m.group(1) + "x" + m.group(2) + (("x" + m.group(3)) if m.group(3) else ""),
+        s,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def search(index: dict[str, Part], query: str, limit: int = 20) -> list[Part]:
-    """Case-insensitive substring match against id and name."""
-    q = query.strip().lower()
+    """Case-insensitive search over id and name. Tolerates 'tile 1x4' / 'Tile 1 x 4'.
+
+    A part matches if every whitespace-split token of the normalized query is
+    present in the normalized name or part_id.
+    """
+    q = _normalize(query)
     if not q:
         return []
-    hits = [p for p in index.values()
-            if q in p.part_id.lower() or q in p.name.lower()]
+    tokens = q.split()
+    hits = []
+    for p in index.values():
+        norm_name = _normalize(p.name)
+        norm_id = p.part_id.lower()
+        if all(tok in norm_name or tok in norm_id for tok in tokens):
+            hits.append(p)
     hits.sort(key=lambda p: (len(p.name), p.part_id))
     return hits[:limit]
