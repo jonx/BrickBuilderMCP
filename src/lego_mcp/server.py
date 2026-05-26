@@ -1175,18 +1175,33 @@ def _suggest_for_floating(inst) -> str:
     return f"Place a supporting brick directly below part {inst.instance_id}."
 
 
+def _resolve_export_path(path: str) -> Path:
+    """Honor absolute paths and ~-paths verbatim. Relative paths land in the
+    user-writable renders dir so exports work under Claude Desktop where the
+    cwd is read-only."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = _renders_dir() / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 @mcp.tool()
 def export_ldr(path: str) -> dict[str, Any]:
-    """Write the model as a single-file .ldr."""
-    Path(path).expanduser().write_text(emit_ldr(STATE))
-    return {"ok": True, "path": str(Path(path).expanduser()), "parts": len(STATE.parts)}
+    """Write the model as a single-file .ldr. Relative paths land in the
+    server's renders dir so exports work under Claude Desktop."""
+    out = _resolve_export_path(path)
+    out.write_text(emit_ldr(STATE))
+    return {"ok": True, "path": str(out), "parts": len(STATE.parts)}
 
 
 @mcp.tool()
 def export_mpd(path: str) -> dict[str, Any]:
-    """Write the model as a single-block .mpd (multi-block support coming)."""
-    Path(path).expanduser().write_text(emit_mpd(STATE))
-    return {"ok": True, "path": str(Path(path).expanduser()), "parts": len(STATE.parts)}
+    """Write the model as a multi-block .mpd. Relative paths land in the
+    server's renders dir so exports work under Claude Desktop."""
+    out = _resolve_export_path(path)
+    out.write_text(emit_mpd(STATE))
+    return {"ok": True, "path": str(out), "parts": len(STATE.parts)}
 
 
 @mcp.tool()
@@ -1358,6 +1373,17 @@ def remove_note(key: str) -> dict[str, Any]:
     return {"ok": True, "key": key, "remaining": len(STATE.notes)}
 
 
+def _renders_dir() -> Path:
+    """Where renders go. Defaults to a user-writable absolute path so the
+    server works under Claude Desktop / launchd / any GUI host where the
+    working directory isn't user-writable. Override with LEGO_MCP_RENDERS_DIR.
+    """
+    override = os.environ.get("LEGO_MCP_RENDERS_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path.home() / "Library" / "Application Support" / "lego_mcp" / "renders").resolve()
+
+
 # render_model is registered when render.py imports cleanly (Pillow present).
 try:
     from lego_mcp.render import render_model_png  # noqa: F401
@@ -1368,9 +1394,9 @@ try:
                      hidden_edges: bool = True) -> dict[str, Any]:
         """Render the model as an isometric PNG.
 
-        Writes to ./renders/<timestamp>_<model>.png so the history is preserved —
-        come back later and scroll the renders folder to see how the model evolved.
-        Also updates ./renders/latest.png as a convenience pointer.
+        Writes to ~/Library/Application Support/lego_mcp/renders/<timestamp>_<model>.png
+        (override with the LEGO_MCP_RENDERS_DIR env var). The path is also
+        updated as <renders>/latest.png as a convenience pointer.
 
         Args:
             color_mode: "model" uses actual part colors. "instance" assigns a
@@ -1381,8 +1407,8 @@ try:
         """
         from datetime import datetime
 
-        renders_dir = Path("renders").resolve()
-        renders_dir.mkdir(exist_ok=True)
+        renders_dir = _renders_dir()
+        renders_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
         out = renders_dir / f"{stamp}_{safe_name}.png"
@@ -1392,6 +1418,7 @@ try:
         # Convenience latest pointer (real file, not symlink — works on all filesystems).
         (renders_dir / "latest.png").write_bytes(png)
         return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
+                "renders_dir": str(renders_dir),
                 "parts": len(STATE.parts), "width": width, "height": height,
                 "color_mode": color_mode, "hidden_edges": hidden_edges}
 
@@ -1403,12 +1430,11 @@ try:
         unbuilt parts show as ghosts (washed-out, no studs). Use this in a
         builder loop to see what's been placed vs what's still to come.
 
-        Writes to ./renders/<timestamp>_<model>_progress.png AND updates
-        ./renders/latest.png like render_model does.
+        Writes to the same renders dir as render_model (see its docstring).
         """
         from datetime import datetime
-        renders_dir = Path("renders").resolve()
-        renders_dir.mkdir(exist_ok=True)
+        renders_dir = _renders_dir()
+        renders_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
         out = renders_dir / f"{stamp}_{safe_name}_progress.png"
@@ -1418,6 +1444,7 @@ try:
         out.write_bytes(png)
         (renders_dir / "latest.png").write_bytes(png)
         return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
+                "renders_dir": str(renders_dir),
                 "built": len(STATE.built), "total": len(STATE.parts),
                 "width": width, "height": height}
 except ImportError:

@@ -8,7 +8,8 @@ from lego_mcp import server
 
 
 def test_renderer_produces_png(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    # Override the renders dir so the test doesn't pollute the user's home.
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)
     server.add_part("3001", "blue", 0, -24, 0)
@@ -20,19 +21,19 @@ def test_renderer_produces_png(tmp_path, monkeypatch):
     assert p.exists()
     assert p.stat().st_size > 1000
     assert p.read_bytes().startswith(b"\x89PNG")
-    # Sanity: written under the temp cwd, not project root.
+    # Sanity: written under the overridden renders dir.
     assert str(p).startswith(str(tmp_path))
 
 
 def test_renderer_empty_model(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     r = server.render_model(200, 150)
     assert r["ok"]
 
 
 def test_renderer_debug_color_modes(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)
     server.add_part("3001", "red", 40, -24, 0)
