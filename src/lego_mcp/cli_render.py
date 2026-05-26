@@ -101,6 +101,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "'rotation' = color by orientation."))
     p.add_argument("--hidden-edges", action="store_true",
                    help="Draw fully-covered contact faces as dotted lines.")
+    p.add_argument("--view-angle", type=float, default=0.0, metavar="DEG",
+                   help=("Camera azimuth in degrees, rotating around the world "
+                         "Y-axis. 0 = default iso view; try 45, 90, 135, 180, "
+                         "etc. to spin around the model. Default: 0."))
+    p.add_argument("--turntable", type=int, default=None, metavar="N",
+                   help=("Instead of one image, write N renders sweeping a full "
+                         "360°. With --output set, the path gets a _NNN suffix "
+                         "before .png; otherwise frames go next to the input as "
+                         "<input-stem>_NNN.png. Overrides --view-angle."))
     p.add_argument("--background", type=_parse_hex_color, default=(245, 245, 248),
                    metavar="#RRGGBB",
                    help="Background color as hex. Default: #f5f5f8.")
@@ -152,26 +161,40 @@ def render_cmd(argv: list[str]) -> int:
               f"({result.get('known_parts', 0)} known, "
               f"{result.get('unknown_parts', 0)} unknown)")
 
-    if not args.quiet:
-        print(f"rendering {args.width}x{args.height} ...")
-    png = render_model_png(
-        server.STATE.parts, server.PART_INDEX,
-        width=args.width, height=args.height,
-        background=args.background,
-        color_mode=args.color_mode,
-        hidden_edges=args.hidden_edges,
-    )
-
-    if args.watermark:
-        png = _draw_watermark(
-            png, args.watermark,
-            position=args.watermark_position,
-            color=args.watermark_color,
-            opacity=args.watermark_opacity,
-            size=args.watermark_size,
-            margin=args.watermark_margin,
+    def render_at(angle: float) -> bytes:
+        if not args.quiet:
+            print(f"rendering {args.width}x{args.height} @ {angle:.0f}° ...")
+        png = render_model_png(
+            server.STATE.parts, server.PART_INDEX,
+            width=args.width, height=args.height,
+            background=args.background,
+            color_mode=args.color_mode,
+            hidden_edges=args.hidden_edges,
+            view_angle=angle,
         )
+        if args.watermark:
+            png = _draw_watermark(
+                png, args.watermark,
+                position=args.watermark_position,
+                color=args.watermark_color,
+                opacity=args.watermark_opacity,
+                size=args.watermark_size,
+                margin=args.watermark_margin,
+            )
+        return png
 
+    if args.turntable and args.turntable > 0:
+        for i in range(args.turntable):
+            angle = 360.0 * i / args.turntable
+            png = render_at(angle)
+            stem = output_path.with_suffix("").name
+            frame_path = output_path.with_name(f"{stem}_{i:03d}.png")
+            frame_path.write_bytes(png)
+            if not args.quiet:
+                print(f"  wrote {frame_path}  ({len(png) / 1024:.1f} KB)")
+        return 0
+
+    png = render_at(args.view_angle)
     output_path.write_bytes(png)
     if not args.quiet:
         kb = len(png) / 1024

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import io
 import math
+from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PIL import Image, ImageDraw
@@ -27,6 +29,7 @@ STUD_HEIGHT = 4.0      # LDU
 STUD_CIRCLE_SIDES = 12
 MAX_STUDS_PER_PART = 256  # skip on baseplate-size parts to keep render fast
 FACE_COVER_TOL = 0.5
+MESH_MAX_DEPTH = 8
 
 DEBUG_PALETTE: tuple[tuple[int, int, int], ...] = (
     (226, 74, 51),
@@ -43,6 +46,10 @@ DEBUG_PALETTE: tuple[tuple[int, int, int], ...] = (
     (89, 161, 113),
 )
 
+Vec3 = tuple[float, float, float]
+MeshFace = tuple[Vec3, ...]
+Transform12 = tuple[float, float, float, float, float, float, float, float, float, float, float, float]
+
 
 def _project(x: float, y: float, z: float) -> tuple[float, float]:
     """Isometric projection. LDraw convention: -Y is up.
@@ -56,6 +63,145 @@ def _project(x: float, y: float, z: float) -> tuple[float, float]:
 
 def _shade(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return tuple(max(0, min(255, int(c * factor))) for c in rgb)  # type: ignore[return-value]
+
+
+def _apply_transform12(t: Transform12, v: Vec3) -> Vec3:
+    x, y, z = v
+    return (
+        t[0] + t[3] * x + t[4] * y + t[5] * z,
+        t[1] + t[6] * x + t[7] * y + t[8] * z,
+        t[2] + t[9] * x + t[10] * y + t[11] * z,
+    )
+
+
+def _compose_transform12(a: Transform12, b: Transform12) -> Transform12:
+    """Compose LDraw type-1 transforms: world = a @ b."""
+    ax, ay, az = a[0], a[1], a[2]
+    am = a[3:12]
+    bx, by, bz = b[0], b[1], b[2]
+    bm = b[3:12]
+    nx = ax + am[0] * bx + am[1] * by + am[2] * bz
+    ny = ay + am[3] * bx + am[4] * by + am[5] * bz
+    nz = az + am[6] * bx + am[7] * by + am[8] * bz
+
+    def row(i: int) -> tuple[float, float, float]:
+        return (
+            am[i * 3] * bm[0] + am[i * 3 + 1] * bm[3] + am[i * 3 + 2] * bm[6],
+            am[i * 3] * bm[1] + am[i * 3 + 1] * bm[4] + am[i * 3 + 2] * bm[7],
+            am[i * 3] * bm[2] + am[i * 3 + 1] * bm[5] + am[i * 3 + 2] * bm[8],
+        )
+
+    return (nx, ny, nz) + row(0) + row(1) + row(2)
+
+
+def _resolve_ldraw_file(filename: str) -> Path | None:
+    """Resolve a part/subpart/primitive filename inside the installed library."""
+    from lego_mcp.parts import LDRAW_HOME
+
+    fname = filename.strip().lower().replace("\\", "/")
+    base = Path(fname).name
+    candidates = [
+        LDRAW_HOME / "parts" / fname,
+        LDRAW_HOME / "parts" / "s" / base,
+        LDRAW_HOME / "p" / fname,
+        LDRAW_HOME / "p" / base,
+        LDRAW_HOME / fname,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _parse_mesh_file(filename: str, transform: Transform12, depth: int = 0) -> list[MeshFace]:
+    """Recursively collect LDraw triangle/quad geometry in part-local coords."""
+    if depth > MESH_MAX_DEPTH:
+        return []
+    path = _resolve_ldraw_file(filename)
+    if path is None:
+        return []
+    try:
+        text = path.read_text(encoding="latin-1", errors="ignore")
+    except OSError:
+        return []
+
+    faces: list[MeshFace] = []
+    invert_next = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("0 bfc invertnext"):
+            invert_next = True
+            continue
+        head = s.split(maxsplit=1)[0]
+        if head == "1":
+            tokens = s.split()
+            if len(tokens) < 15:
+                invert_next = False
+                continue
+            try:
+                values = tuple(float(t) for t in tokens[2:14])
+            except ValueError:
+                invert_next = False
+                continue
+            child_name = " ".join(tokens[14:]).strip()
+            child_transform = _compose_transform12(transform, values)  # type: ignore[arg-type]
+            child_faces = _parse_mesh_file(child_name, child_transform, depth + 1)
+            if invert_next:
+                child_faces = tuple(tuple(reversed(face)) for face in child_faces)  # type: ignore[assignment]
+            faces.extend(child_faces)
+            invert_next = False
+        elif head in {"3", "4"}:
+            tokens = s.split()
+            needed = 11 if head == "3" else 14
+            if len(tokens) < needed:
+                invert_next = False
+                continue
+            try:
+                coords = [float(t) for t in tokens[2:needed]]
+            except ValueError:
+                invert_next = False
+                continue
+            verts = [_apply_transform12(transform, (coords[i], coords[i + 1], coords[i + 2]))
+                     for i in range(0, len(coords), 3)]
+            if invert_next:
+                verts.reverse()
+            faces.append(tuple(verts))
+            invert_next = False
+        else:
+            invert_next = False
+    return faces
+
+
+@lru_cache(maxsize=4096)
+def _part_mesh_faces(part_id: str) -> tuple[MeshFace, ...]:
+    """Return cached real LDraw faces for a part, or empty tuple on fallback."""
+    identity: Transform12 = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                             0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    faces = _parse_mesh_file(f"{part_id}.dat", identity)
+    return tuple(faces)
+
+
+def _face_shade_factor(corners3d: list[Vec3]) -> float:
+    if len(corners3d) < 3:
+        return 0.85
+    ax, ay, az = corners3d[0]
+    bx, by, bz = corners3d[1]
+    cx, cy, cz = corners3d[2]
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx = uy * vz - uz * vy
+    ny = uz * vx - ux * vz
+    nz = ux * vy - uy * vx
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-6:
+        return 0.85
+    nx, ny, nz = nx / length, ny / length, nz / length
+    # LDraw winding is not guaranteed without full BFC handling. Use absolute
+    # components so the two sides of thin plates shade consistently.
+    return 0.62 + 0.36 * abs(ny) + 0.12 * max(abs(nx), abs(nz))
 
 
 def _debug_rgb(inst: "PartInstance", ordinal: int, mode: str,
@@ -212,6 +358,7 @@ def render_model_png(
     hidden_edges: bool = True,
     built_set: set[str] | None = None,
     instance_color_override: dict[str, tuple[int, int, int]] | None = None,
+    view_angle: float = 0.0,
 ) -> bytes:
     """Render the model and return PNG bytes.
 
@@ -222,6 +369,10 @@ def render_model_png(
     `instance_color_override`: per-part-id RGB override. Takes precedence over
     `color_mode`. Used by `render_validation` to color parts by their error
     status (red = collision, orange = floating, etc).
+
+    `view_angle`: camera azimuth in degrees, rotating around the world Y-axis
+    (LDraw's vertical). 0 keeps the default iso view; +90 spins the camera a
+    quarter-turn clockwise as seen from above. Pitch stays at 30°.
     """
     from lego_mcp.parts import color_rgb
     from lego_mcp.server import part_aabb_world
@@ -234,6 +385,20 @@ def render_model_png(
         buf = io.BytesIO()
         img.save(buf, "PNG")
         return buf.getvalue()
+
+    # Camera yaw: rotate world around +Y by view_angle, then run the standard
+    # iso projection. closeness_x / closeness_z below are the X and Z
+    # multipliers that fall out of "X' - Y' + Z'" after a yaw of θ.
+    yaw_rad = math.radians(view_angle)
+    cos_yaw = math.cos(yaw_rad)
+    sin_yaw = math.sin(yaw_rad)
+    closeness_x = cos_yaw - sin_yaw
+    closeness_z = sin_yaw + cos_yaw
+
+    def project(x: float, y: float, z: float) -> tuple[float, float]:
+        xr = cos_yaw * x + sin_yaw * z
+        zr = -sin_yaw * x + cos_yaw * z
+        return _project(xr, y, zr)
 
     # Build draw commands for visible face fills plus edge overlays.
     # Painter's algorithm works face-by-face, but a single large face (like a
@@ -251,8 +416,8 @@ def render_model_png(
     all_proj: list[tuple[float, float]] = []
 
     def _emit_face(corners3d: list[tuple[float, float, float]], fill: tuple[int, int, int]) -> None:
-        closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
-        screen = [_project(*c) for c in corners3d]
+        closeness = sum(closeness_x * cx - cy + closeness_z * cz for (cx, cy, cz) in corners3d) / len(corners3d)
+        screen = [project(*c) for c in corners3d]
         faces.append((closeness, screen, fill))
         all_proj.extend(screen)
 
@@ -279,9 +444,9 @@ def render_model_png(
     HIDDEN_RGB = (80, 80, 80)
 
     # For the oriented-box path used by parts with non-canonical matrices.
-    # Camera direction in iso view (+X right, -Y up, +Z forward toward viewer):
-    # visible faces are those whose centroid points in (+1, -1, +1) from box centroid.
-    CAM_DIR = (1.0, -1.0, 1.0)
+    # Camera direction in world frame after the yaw above: visible faces are
+    # those whose centroid points along this vector from the box centroid.
+    CAM_DIR = (closeness_x, -1.0, closeness_z)
     # 6 faces of a local bbox, each as 4 corner indices (CCW from outside).
     # Local frame: top at y=-h, bottom at y=0, length along x, depth along z.
     # Corner indexing: 0..3 = top (y=-h), 4..7 = bottom (y=0), each ring CCW
@@ -341,12 +506,29 @@ def render_model_png(
             _emit_edge(corners)
 
     def _emit_edge(corners3d: list[tuple[float, float, float]], style: str = "solid") -> None:
-        closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
-        screen = [_project(*c) for c in corners3d]
+        closeness = sum(closeness_x * cx - cy + closeness_z * cz for (cx, cy, cz) in corners3d) / len(corners3d)
+        screen = [project(*c) for c in corners3d]
         target = hidden_outlines if style == "dotted" else outlines
         color = HIDDEN_RGB if style == "dotted" else OUTLINE_RGB
         target.append((closeness, screen, color, style))
         all_proj.extend(screen)
+
+    def _render_real_mesh(inst, part, rgb_face, draw_edges: bool) -> bool:
+        """Draw real LDraw mesh faces when the installed library has them."""
+        mesh = _part_mesh_faces(part.part_id)
+        if not mesh:
+            return False
+        m = effective_matrix(inst)
+        for local_face in mesh:
+            world: list[Vec3] = []
+            for lx, ly, lz in local_face:
+                wx, wy, wz = matrix_apply(m, (lx, ly, lz))
+                world.append((wx + inst.x, wy + inst.y, wz + inst.z))
+            if len(world) >= 3:
+                _emit_face(world, _shade(rgb_face, _face_shade_factor(world)))
+                if draw_edges:
+                    _emit_edge(world)
+        return True
 
     part_records = []
     for ordinal, inst in enumerate(parts.values()):
@@ -371,6 +553,9 @@ def render_model_png(
         is_ghost = built_set is not None and inst.instance_id not in built_set
         if is_ghost:
             rgb = _ghost(rgb)
+
+        if _render_real_mesh(inst, part, rgb, draw_edges=not is_ghost):
+            continue
 
         # Parts with a non-canonical rotation matrix (imported from external
         # LDraw files that use tilted/3D-rotated sub-modules) need to draw as
