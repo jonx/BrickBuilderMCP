@@ -95,23 +95,26 @@ So a 2×4 brick at `y=0` sits on the ground; stack another on top at `y=-24`.
 
 ```python
 # (or have Claude do the same via tool calls)
-from lego_mcp.server import create_model, add_part, render_model
+import lego_mcp.server as s
 
-create_model("tiny_house")
-add_part("3811", "tan", 0, 0, 0)                                  # 32x32 baseplate
-for x in range(-2, 3):
-    for z in range(-2, 3):
-        add_part("3022", "dark_tan", x*40, -4, z*40)               # floor
+s.create_model("tiny_house")
+s.add_part("3811", "tan", 0, 0, 0)                                # 32x32 baseplate
 
-for y in [-12, -36, -60]:                                          # 3 plate-rows of walls
-    for i in range(-2, 3):
-        add_part("3001", "red", i*40, y, -100)
-        add_part("3001", "red", i*40, y,  100)
-    for i in range(-1, 2):
-        add_part("3001", "red", -100, y, i*40, rotation="rot90y")
-        add_part("3001", "red",  100, y, i*40, rotation="rot90y")
+# A 6x6-stud building. A 2x4 brick is 80 LDU along +X and 40 along +Z.
+for y in [-12, -36, -60]:                                         # 3 brick rows
+    for i in (-1, 0, 1):
+        s.add_part("3001", "red", i*80, y,  100)                  # front wall
+        s.add_part("3001", "red", i*80, y, -100)                  # back wall
+    for j in (-1, 1):
+        s.add_part("3001", "red",  100, y, j*40, rotation="rot90y")  # right
+        s.add_part("3001", "red", -100, y, j*40, rotation="rot90y")  # left
 
-render_model()
+# Gabled roof
+for i in (-1, 0, 1):
+    s.add_part("3037", "blue", i*80, -84,  100)
+    s.add_part("3037", "blue", i*80, -84, -100, rotation="rot180y")
+
+s.render_model()
 ```
 
 See [examples/tiny_house.mpd](examples/tiny_house.mpd) for the exported model — open it in BrickLink Studio or LeoCAD.

@@ -33,65 +33,73 @@ class Part:
     height: int      # height upward (toward -Y), LDU
 
 
-def _brick(part_id: str, w_studs: int, d_studs: int, plates: int = 3, name: str | None = None) -> Part:
+# LDraw convention: a "Brick A x B" has the LARGER dimension along +X (width)
+# and the smaller along +Z (depth). Helper args (long_studs, short_studs)
+# reflect physical dimensions in studs; the human-readable name keeps the
+# conventional "AxB" ordering.
+
+def _brick(part_id: str, long_studs: int, short_studs: int, plates: int = 3,
+           name: str | None = None) -> Part:
     return Part(
         part_id=part_id,
-        name=name or f"Brick {w_studs}x{d_studs}",
-        width=w_studs * LDU_PER_STUD,
-        depth=d_studs * LDU_PER_STUD,
+        name=name or f"Brick {short_studs}x{long_studs}",
+        width=long_studs * LDU_PER_STUD,
+        depth=short_studs * LDU_PER_STUD,
         height=plates * LDU_PER_PLATE,
     )
 
 
-def _plate(part_id: str, w_studs: int, d_studs: int, name: str | None = None) -> Part:
-    return _brick(part_id, w_studs, d_studs, plates=1, name=name or f"Plate {w_studs}x{d_studs}")
+def _plate(part_id: str, long_studs: int, short_studs: int, name: str | None = None) -> Part:
+    return _brick(part_id, long_studs, short_studs, plates=1,
+                  name=name or f"Plate {short_studs}x{long_studs}")
 
 
-def _tile(part_id: str, w_studs: int, d_studs: int, name: str | None = None) -> Part:
-    return _brick(part_id, w_studs, d_studs, plates=1, name=name or f"Tile {w_studs}x{d_studs}")
+def _tile(part_id: str, long_studs: int, short_studs: int, name: str | None = None) -> Part:
+    return _brick(part_id, long_studs, short_studs, plates=1,
+                  name=name or f"Tile {short_studs}x{long_studs}")
 
 
 # Built-in catalog: ~30 common bricks/plates/tiles + a baseplate.
-# IDs match real LDraw part numbers so exports open correctly in LDraw viewers.
+# Dimensions follow LDraw's actual part geometry (long axis = +X).
 BUILTIN_PARTS: dict[str, Part] = {p.part_id: p for p in [
-    # Bricks
+    # Bricks  (long, short)
     _brick("3005", 1, 1),
-    _brick("3004", 1, 2),
-    _brick("3622", 1, 3),
-    _brick("3010", 1, 4),
-    _brick("3009", 1, 6),
-    _brick("3008", 1, 8),
+    _brick("3004", 2, 1),
+    _brick("3622", 3, 1),
+    _brick("3010", 4, 1),
+    _brick("3009", 6, 1),
+    _brick("3008", 8, 1),
     _brick("3003", 2, 2),
-    _brick("3002", 2, 3),
-    _brick("3001", 2, 4),
-    _brick("2456", 2, 6),
-    _brick("3006", 2, 10),
+    _brick("3002", 3, 2),
+    _brick("3001", 4, 2),
+    _brick("2456", 6, 2),
+    _brick("3006", 10, 2),
     # Plates
     _plate("3024", 1, 1),
-    _plate("3023", 1, 2),
-    _plate("3623", 1, 3),
-    _plate("3710", 1, 4),
-    _plate("3666", 1, 6),
-    _plate("3460", 1, 8),
-    _plate("4477", 1, 10),
+    _plate("3023", 2, 1),
+    _plate("3623", 3, 1),
+    _plate("3710", 4, 1),
+    _plate("3666", 6, 1),
+    _plate("3460", 8, 1),
+    _plate("4477", 10, 1),
     _plate("3022", 2, 2),
-    _plate("3021", 2, 3),
-    _plate("3020", 2, 4),
-    _plate("3795", 2, 6),
-    _plate("3034", 2, 8),
-    _plate("3832", 2, 10),
+    _plate("3021", 3, 2),
+    _plate("3020", 4, 2),
+    _plate("3795", 6, 2),
+    _plate("3034", 8, 2),
+    _plate("3832", 10, 2),
     _plate("3031", 4, 4),
-    _plate("3035", 4, 8),
-    _plate("3036", 6, 8),
+    _plate("3035", 8, 4),
+    _plate("3036", 8, 6),
     # Tiles
-    Part("3070b", "Tile 1x1", LDU_PER_STUD, LDU_PER_STUD, LDU_PER_PLATE),
-    Part("3069b", "Tile 1x2", LDU_PER_STUD, 2 * LDU_PER_STUD, LDU_PER_PLATE),
-    Part("2431",  "Tile 1x4", LDU_PER_STUD, 4 * LDU_PER_STUD, LDU_PER_PLATE),
-    Part("3068b", "Tile 2x2", 2 * LDU_PER_STUD, 2 * LDU_PER_STUD, LDU_PER_PLATE),
+    _tile("3070b", 1, 1),
+    _tile("3069b", 2, 1),
+    _tile("2431",  4, 1),
+    _tile("3068b", 2, 2),
     # Slopes (AABB is the bounding box — the slope itself is inside)
-    _brick("3040", 1, 2, name="Slope 45 1x2"),
+    _brick("3040", 2, 1, name="Slope 45 1x2"),
     _brick("3039", 2, 2, name="Slope 45 2x2"),
-    _brick("3037", 2, 4, name="Slope 45 2x4"),
+    _brick("3037", 4, 2, name="Slope 45 2x4"),
     # Baseplates
     Part("3811", "Baseplate 32x32", 32 * LDU_PER_STUD, 32 * LDU_PER_STUD, LDU_PER_PLATE // 2),
     Part("3857", "Baseplate 16x16", 16 * LDU_PER_STUD, 16 * LDU_PER_STUD, LDU_PER_PLATE // 2),

@@ -34,3 +34,18 @@ def test_search_empty_returns_nothing():
 def test_search_matches_part_id():
     hits = search(BUILTIN_PARTS, "3001")
     assert any(p.part_id == "3001" for p in hits)
+
+
+def test_builtin_dimensions_follow_ldraw_convention():
+    """A 'Brick 2x4' has its long axis (4 studs) along +X. Built-in
+    dimensions must agree with what an LDraw viewer would render, or imports
+    of our exports will show different geometry than our internal AABBs."""
+    # 2x4 brick: width=80 (4 studs along X), depth=40 (2 studs along Z)
+    b = BUILTIN_PARTS["3001"]
+    assert b.width == 80 and b.depth == 40, f"3001 wrong: {b}"
+    # 1x4 plate
+    p = BUILTIN_PARTS["3710"]
+    assert p.width == 80 and p.depth == 20, f"3710 wrong: {p}"
+    # 1x1 brick (symmetric — both 20)
+    s1 = BUILTIN_PARTS["3005"]
+    assert s1.width == 20 and s1.depth == 20

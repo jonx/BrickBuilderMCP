@@ -103,7 +103,19 @@ class ModelState:
 
 STATE = ModelState()
 PART_INDEX: dict[str, Part] = dict(BUILTIN_PARTS)
+_LIBRARY_LOADED = False
 UNDO_LIMIT = 200
+
+
+def _ensure_library_loaded() -> None:
+    """Load the full LDraw library the first time it's needed. Idempotent."""
+    global PART_INDEX, _LIBRARY_LOADED
+    if _LIBRARY_LOADED:
+        return
+    _LIBRARY_LOADED = True
+    full = load_library_index()
+    # full already includes BUILTIN_PARTS as overrides (see parts.load_library_index)
+    PART_INDEX = full
 
 
 def _snapshot_for_undo(description: str) -> None:
@@ -116,6 +128,10 @@ def _snapshot_for_undo(description: str) -> None:
 
 def _require_part(part_id: str) -> Part:
     p = PART_INDEX.get(part_id) or PART_INDEX.get(part_id.lower())
+    if p is None:
+        # First miss: load the full library and retry, in case the user installed it.
+        _ensure_library_loaded()
+        p = PART_INDEX.get(part_id) or PART_INDEX.get(part_id.lower())
     if not p:
         raise ValueError(
             f"Unknown part {part_id!r}. Use search_parts() to find one, or run "
@@ -339,6 +355,7 @@ def list_parts(limit: int = 200) -> dict[str, Any]:
 @mcp.tool()
 def search_parts_tool(query: str, limit: int = 20) -> dict[str, Any]:
     """Search the active part catalog (built-in + LDraw library if installed)."""
+    _ensure_library_loaded()
     hits = search_parts(PART_INDEX, query, limit)
     return {"query": query, "count": len(hits),
             "parts": [{"part_id": p.part_id, "name": p.name,
@@ -510,7 +527,6 @@ except ImportError:
 
 def run() -> None:
     """Load the part library (built-in or installed), then serve over stdio."""
-    global PART_INDEX
-    PART_INDEX = load_library_index()
+    _ensure_library_loaded()
     log.info("LegoMCP starting. %d parts loaded.", len(PART_INDEX))
     mcp.run()
