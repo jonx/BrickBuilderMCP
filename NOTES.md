@@ -54,3 +54,40 @@ None of these change Phase 1 *yet*, but I want the seams to exist:
 - Is 6 rotations the right ceiling, or jump straight to matrices?
 - Should `validate_model` block mutations on collision, or always allow + report?
 - Built-in catalog: which 30 parts? Currently leaning toward classic City-set bricks.
+
+## Self-test findings (Phase 1)
+
+I built a tiny house (46 parts), a gothic tower (72 parts), a 4-tower castle
+(120 parts), and a cathedral facade attempt (92 parts) end-to-end through the
+server's own tools. Every render is in [renders/](renders/). Bugs caught while
+doing that and fixed in the same session:
+
+- **Built-in dim convention was backwards.** A "Brick 2x4" in LDraw is 80 LDU
+  along +X and 40 along +Z; my helper had the args swapped. Exports were valid
+  LDraw but viewers showed them rotated 90deg from my Python renders. Fixed in
+  parts.py + regression test.
+- **`STATE` was rebound, not mutated.** `create_model` / `import_ldr` /
+  `restore_checkpoint` replaced the module attribute, silently breaking any
+  external `from server import STATE`. Now all three mutate in place.
+- **Library wasn't loaded for direct use.** `PART_INDEX` was populated only in
+  `run()`, so scripts that imported tools directly saw only 36 built-ins.
+  Lazy-loads on first miss now.
+- **Search was too strict.** `"tile 1x4"` couldn't find LDraw's `"Tile  1 x  4"`.
+  Added size-pattern normalization (`1x4` <-> `1 x 4`) and token-AND matching.
+- **`install-library` needed a real User-Agent.** library.ldraw.org returns 403
+  to default urllib.
+- **Renderer's painter sort fails on big-vs-small overlaps.** A baseplate's
+  centroid is closer to camera than a small brick on top of it, so naive
+  per-object painter's puts the baseplate in front. Subdividing large faces
+  into ~2-stud chunks lets the per-face sort handle stacking correctly.
+
+What I would NOT change yet, despite weak points I noticed:
+
+- AABB collision still produces some false positives at corners (a 2x4 brick
+  against a 2x2 brick at the corner). Acceptable — the LLM can read the error
+  list and override.
+- The built-in renderer doesn't show studs or slope geometry. Slopes render as
+  AABBs (visually a brick of the same footprint). Path to fix: render slope
+  surface, or shell out to LDView for high-quality output.
+- Outlines bleed through occlusion when enabled. Currently disabled; the
+  three-tone shading reads as 3D well enough for iteration.
