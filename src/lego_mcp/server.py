@@ -1114,9 +1114,10 @@ except ImportError:
 def run() -> None:
     """Load the part library (built-in or installed), then serve over stdio."""
     _ensure_library_loaded()
-    from lego_mcp.prompts import register_prompts
+    from lego_mcp.prompts import register_prompts, register_resources
     from lego_mcp.helpers import register_helpers
     register_prompts(mcp)
+    register_resources(mcp)
     register_helpers(mcp)
     log.info("LegoMCP starting. %d parts loaded.", len(PART_INDEX))
     mcp.run()

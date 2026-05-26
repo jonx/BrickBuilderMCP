@@ -80,6 +80,14 @@ def test_server_initializes_and_calls_tool():
         for expected in ("build", "from_plans", "from_image", "rescue", "techniques"):
             assert expected in prompt_names, f"prompt {expected!r} missing; got {prompt_names}"
 
+        # 3c. list resources — verify the reference resources are exposed.
+        _send(proc, {"jsonrpc": "2.0", "id": 26, "method": "resources/list"})
+        resp = _read_until(proc, 26)
+        resource_uris = {r["uri"] for r in resp["result"]["resources"]}
+        for expected in ("lego://techniques", "lego://coords", "lego://workflow",
+                         "lego://model/current"):
+            assert expected in resource_uris, f"resource {expected!r} missing; got {resource_uris}"
+
         # 4. create_model + add_part — verify a real round-trip call works
         _send(proc, {
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",

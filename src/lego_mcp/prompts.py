@@ -57,6 +57,35 @@ def _user(text: str) -> dict:
     return {"role": "user", "content": text}
 
 
+def register_resources(mcp) -> None:
+    """Attach LegoMCP resources to a FastMCP instance. Resources are read-only
+    pieces of data the LLM can fetch; complements the action-taking tools."""
+
+    @mcp.resource("lego://techniques", mime_type="text/markdown")
+    def techniques_resource() -> str:
+        return "# LEGO building techniques\n\n" + TECHNIQUES_BLURB
+
+    @mcp.resource("lego://coords", mime_type="text/markdown")
+    def coords_resource() -> str:
+        return "# LDraw coordinate convention\n\n" + COORDS_BLURB
+
+    @mcp.resource("lego://workflow", mime_type="text/markdown")
+    def workflow_resource() -> str:
+        return "# Recommended build workflow\n\n" + WORKFLOW_BLURB
+
+    @mcp.resource("lego://model/current", mime_type="application/json")
+    def current_model_resource() -> str:
+        import json
+        from lego_mcp import server
+        return json.dumps({
+            "model": server.STATE.name,
+            "current_subassembly": server.STATE.current_subassembly,
+            "parts_total": len(server.STATE.parts),
+            "subassemblies": sorted({p.subassembly for p in server.STATE.parts.values()}),
+            "notes": list(server.STATE.notes.keys()),
+        })
+
+
 def register_prompts(mcp) -> None:
     """Attach all LegoMCP prompts to a FastMCP instance."""
 
