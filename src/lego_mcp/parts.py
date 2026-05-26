@@ -41,6 +41,13 @@ class Part:
     height: int      # height upward (toward -Y), LDU
     studs: tuple[tuple[float, float, float], ...] = ()
     antistuds: tuple[tuple[float, float, float], ...] = ()
+    # bbox: ((minx, miny, minz), (maxx, maxy, maxz)) in part-local coords. The
+    # part's LDraw origin is at (0,0,0); the bbox may be asymmetric around it
+    # (true for slopes — the high edge is offset from origin). When the parser
+    # can't compute, falls back to (-w/2, -h, -d/2)..(w/2, 0, d/2).
+    bbox: tuple[tuple[float, float, float], tuple[float, float, float]] = (
+        (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    )
 
 
 # LDraw convention: a "Brick A x B" has the LARGER dimension along +X (width)
@@ -253,21 +260,26 @@ def _parse_dat(path: Path) -> tuple[str, list[tuple[str, str, tuple[float, ...]]
 
 
 def _collect_vertices(filename: str, transform: tuple[float, ...], ldraw_home: Path,
-                      visited: set[str], max_depth: int = 3, depth: int = 0,
+                      visited: set[str], max_depth: int = 5, depth: int = 0,
                       ) -> list[tuple[float, float, float]]:
     """Recursively gather all primitive vertices in part-local coords.
 
-    For each type-1 reference into the s/ subdir, recurse with the composed
-    transform. Cycles guarded by visited set + depth limit.
+    No visited-set dedup: a plate references box5/stud4 many times at
+    different positions; blocking re-entry would drop geometry. max_depth
+    bounds runaway recursion. Paths resolved in parts/, parts/s/, then p/
+    (primitive directory holds box5, stug-NxN, etc.).
     """
-    if depth > max_depth or filename in visited:
+    if depth > max_depth:
         return []
-    visited.add(filename)
     parts_dir = ldraw_home / "parts"
     s_dir = parts_dir / "s"
+    p_dir = ldraw_home / "p"
+    base = Path(filename).name
     path = parts_dir / filename
     if not path.is_file():
-        path = s_dir / Path(filename).name
+        path = s_dir / base
+    if not path.is_file():
+        path = p_dir / base
     if not path.is_file():
         return []
     parsed = _parse_dat(path)
@@ -424,12 +436,20 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
         if cache_mtime >= parts_mtime:
             try:
                 data = json.loads(CACHE_FILE.read_text())
+                def _bbox(entry: dict) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+                    b = entry.get("bbox")
+                    if b and len(b) == 2:
+                        return (tuple(b[0]), tuple(b[1]))  # type: ignore[return-value]
+                    # Old cache without bbox: derive a symmetric one from dims.
+                    w, d, h = entry["width"], entry["depth"], entry["height"]
+                    return ((-w/2, -h, -d/2), (w/2, 0, d/2))
                 return {
                     pid: Part(
                         part_id=pid, name=p["name"],
                         width=p["width"], depth=p["depth"], height=p["height"],
                         studs=tuple(tuple(s) for s in p.get("studs", [])),
                         antistuds=tuple(tuple(s) for s in p.get("antistuds", [])),
+                        bbox=_bbox(p),
                     )
                     for pid, p in data.items()
                 }
@@ -455,6 +475,8 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
             height=max(1, int(round(maxy - miny))),
             studs=tuple(studs_list),
             antistuds=tuple(antistuds_list),
+            bbox=((float(minx), float(miny), float(minz)),
+                  (float(maxx), float(maxy), float(maxz))),
         )
     for pid, p in BUILTIN_PARTS.items():
         index.setdefault(pid, p)
@@ -463,7 +485,8 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
     CACHE_FILE.write_text(json.dumps(
         {pid: {"name": p.name, "width": p.width, "depth": p.depth, "height": p.height,
                "studs": [list(s) for s in p.studs],
-               "antistuds": [list(s) for s in p.antistuds]}
+               "antistuds": [list(s) for s in p.antistuds],
+               "bbox": [list(p.bbox[0]), list(p.bbox[1])]}
          for pid, p in index.items()},
     ))
     return index

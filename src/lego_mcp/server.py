@@ -137,6 +137,10 @@ def _record(op: Op) -> None:
     STATE._redo.clear()
     if len(STATE._undo) > UNDO_LIMIT:
         STATE._undo = STATE._undo[-UNDO_LIMIT:]
+    try:
+        _maybe_autosave()
+    except Exception:  # noqa: BLE001 — autosave must never break the user's flow
+        pass
 
 
 def _apply_forward(op: Op) -> None:
@@ -617,21 +621,86 @@ def search_parts_tool(query: str, limit: int = 20) -> dict[str, Any]:
 search_parts_tool.__name__ = "search_parts"  # type: ignore[attr-defined]
 
 
+def _orientation_hint(p) -> dict[str, Any]:
+    """For slopes (and any asymmetric part), derive a human-readable hint
+    describing where the 'high' (stud-bearing) edge sits in identity rotation.
+
+    Heuristic:
+    - The stud row centroid vs the bbox centroid gives a direction.
+    - Whichever axis (X or Z) the offset is larger on, that's the high-edge axis.
+    - Sign of the offset gives +/-.
+    """
+    name_lower = p.name.lower()
+    is_slope = "slope" in name_lower
+    if not p.studs:
+        return {"shape": "tile_or_smooth_top" if "tile" in name_lower else "no_top_studs"}
+    if not is_slope:
+        return {"shape": "cuboid", "stud_count": len(p.studs)}
+    # Slope: locate stud centroid vs bbox centroid
+    (minx, miny, minz), (maxx, maxy, maxz) = p.bbox
+    cx = (minx + maxx) / 2
+    cz = (minz + maxz) / 2
+    sx = sum(s[0] for s in p.studs) / len(p.studs)
+    sz = sum(s[2] for s in p.studs) / len(p.studs)
+    dx, dz = sx - cx, sz - cz
+    # Pick the dominant axis
+    if abs(dx) >= abs(dz):
+        side = "+X" if dx > 0 else "-X"
+        low = "-X" if dx > 0 else "+X"
+    else:
+        side = "+Z" if dz > 0 else "-Z"
+        low = "-Z" if dz > 0 else "+Z"
+    summary = (f"Slope in identity rotation: HIGH edge (with studs) is at {side} side; "
+               f"slope descends toward {low}. To flip the slope, use rot180y. "
+               f"rot90y rotates the high edge to {'+Z' if side == '+X' else '-Z' if side == '-X' else '-X' if side == '+Z' else '+X'} side.")
+    return {"shape": "slope", "high_edge": side, "low_edge": low,
+            "stud_count": len(p.studs), "summary": summary}
+
+
 @mcp.tool()
 def get_part_info(part_id: str) -> dict[str, Any]:
-    """Get dimensions and name for a part_id."""
+    """Get dimensions, stud info, and (for slopes) orientation hint for a part_id.
+
+    For slopes the response includes an `orientation` block telling you which
+    side has the un-sloped high edge in identity rotation — so you don't have
+    to guess after rotation.
+    """
     p = _require_part(part_id)
     return {"part_id": p.part_id, "name": p.name,
             "width_ldu": p.width, "depth_ldu": p.depth, "height_ldu": p.height,
             "width_studs": round(p.width / 20, 2),
             "depth_studs": round(p.depth / 20, 2),
-            "height_plates": round(p.height / 8, 2)}
+            "height_plates": round(p.height / 8, 2),
+            "stud_count": len(p.studs),
+            "orientation": _orientation_hint(p),
+            "bbox_local": {"min": list(p.bbox[0]), "max": list(p.bbox[1])}}
 
 
 @mcp.tool()
 def list_colors() -> dict[str, Any]:
     """List supported color names and their LDraw IDs."""
     return {"colors": [{"name": name, "id": cid} for name, (cid, _) in COLORS.items()]}
+
+
+@mcp.tool()
+def parts_that_mount_on(part_id: str, limit: int = 20,
+                         min_studs_matched: int = 1) -> dict[str, Any]:
+    """Reverse search: given a part ID, return up to `limit` other parts that
+    can sit on top of it with at least `min_studs_matched` stud-receiver matings.
+
+    Indexed across the full catalog (~23k parts); first call builds the index
+    (~1s), subsequent calls return in milliseconds. Use this to find wheels
+    that mate to an axle plate, plates that fit a brick, tiles that cap a
+    surface, etc.
+    """
+    from lego_mcp.mount_index import parts_that_mount_on as _mount
+    _ensure_library_loaded()
+    target = _require_part(part_id)
+    results = _mount(target, PART_INDEX, limit=limit,
+                      min_studs_matched=min_studs_matched)
+    return {"target": part_id, "target_name": target.name.strip(),
+            "result_count": len(results),
+            "results": results}
 
 
 @mcp.tool()
@@ -1278,11 +1347,35 @@ PROJECTS_DIR = Path(os.environ.get(
     str(Path.home() / "Library" / "Application Support" / "lego_mcp" / "projects"),
 ))
 
+AUTOSAVE_NAME = "_autosave"
+AUTOSAVE_EVERY_N_MUTATIONS = 25
+
 
 def _project_paths(name: str) -> tuple[Path, Path]:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in name) or "untitled"
     base = PROJECTS_DIR / safe
     return base.with_suffix(".mpd"), base.with_suffix(".notes.json")
+
+
+def _maybe_autosave() -> None:
+    """Called after each mutation. Saves to _autosave every N mutations.
+    Atomic-ish: writes to .tmp then renames so a crash mid-write doesn't
+    leave a corrupt autosave."""
+    n = len(STATE._undo)
+    if n == 0 or n % AUTOSAVE_EVERY_N_MUTATIONS != 0:
+        return
+    try:
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        mpd_path, notes_path = _project_paths(AUTOSAVE_NAME)
+        tmp_mpd = mpd_path.with_suffix(".mpd.tmp")
+        tmp_notes = notes_path.with_suffix(".notes.json.tmp")
+        tmp_mpd.write_text(emit_mpd(STATE))
+        tmp_notes.write_text(json.dumps({"name": STATE.name, "notes": STATE.notes,
+                                          "mutations": n}))
+        tmp_mpd.replace(mpd_path)
+        tmp_notes.replace(notes_path)
+    except OSError as e:  # never let autosave break a build
+        log.warning("autosave failed: %s", e)
 
 
 @mcp.tool()
@@ -1333,6 +1426,33 @@ def list_projects() -> dict[str, Any]:
         projects.append({"name": f.stem, "path": str(f),
                          "size_bytes": f.stat().st_size})
     return {"projects": projects, "dir": str(PROJECTS_DIR)}
+
+
+@mcp.tool()
+def restore_autosave() -> dict[str, Any]:
+    """Load the most recent autosave snapshot (written every 25 mutations).
+    Useful when the server restarted mid-build and you want to pick up where
+    you left off."""
+    mpd_path, _ = _project_paths(AUTOSAVE_NAME)
+    if not mpd_path.is_file():
+        return {"ok": False, "reason": "no autosave found", "path": str(mpd_path)}
+    return load_project(AUTOSAVE_NAME)
+
+
+@mcp.tool()
+def autosave_status() -> dict[str, Any]:
+    """Where the autosave lives and when it was last written, plus the
+    current mutation count toward the next autosave."""
+    mpd_path, _ = _project_paths(AUTOSAVE_NAME)
+    exists = mpd_path.is_file()
+    return {
+        "autosave_path": str(mpd_path),
+        "exists": exists,
+        "size_bytes": mpd_path.stat().st_size if exists else 0,
+        "mutations_so_far": len(STATE._undo),
+        "save_every_n": AUTOSAVE_EVERY_N_MUTATIONS,
+        "next_save_in": AUTOSAVE_EVERY_N_MUTATIONS - (len(STATE._undo) % AUTOSAVE_EVERY_N_MUTATIONS),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1387,66 +1507,75 @@ def _renders_dir() -> Path:
 # render_model is registered when render.py imports cleanly (Pillow present).
 try:
     from lego_mcp.render import render_model_png  # noqa: F401
+    from mcp.server.fastmcp import Image as MCPImage
+
+    def _render_to_disk_and_image(png: bytes, name_suffix: str = "") -> tuple[dict[str, Any], MCPImage]:
+        """Common tail: write PNG + latest.png, return (summary_dict, MCPImage)."""
+        from datetime import datetime
+        renders_dir = _renders_dir()
+        renders_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
+        out = renders_dir / f"{stamp}_{safe_name}{name_suffix}.png"
+        out.write_bytes(png)
+        (renders_dir / "latest.png").write_bytes(png)
+        summary = {"ok": True, "path": str(out),
+                   "latest": str(renders_dir / "latest.png"),
+                   "renders_dir": str(renders_dir),
+                   "bytes": len(png)}
+        return summary, MCPImage(data=png, format="png")
 
     @mcp.tool()
     def render_model(width: int = 800, height: int = 600,
                      color_mode: str = "model",
-                     hidden_edges: bool = True) -> dict[str, Any]:
-        """Render the model as an isometric PNG.
+                     hidden_edges: bool = True) -> list:
+        """Render the model as an isometric PNG. Returns BOTH the image (inline
+        for the LLM to see) AND a summary dict with the disk path.
 
-        Writes to ~/Library/Application Support/lego_mcp/renders/<timestamp>_<model>.png
-        (override with the LEGO_MCP_RENDERS_DIR env var). The path is also
-        updated as <renders>/latest.png as a convenience pointer.
+        Disk: <renders_dir>/<timestamp>_<model>.png + latest.png.
+        Override the directory with LEGO_MCP_RENDERS_DIR env var.
 
         Args:
             color_mode: "model" uses actual part colors. "instance" assigns a
                 different color to each piece. "row" colors each brick course.
                 "rotation" colors by orientation.
             hidden_edges: draw fully covered/internal contact faces as dotted
-                guide lines; exposed outside edges remain solid.
+                guide lines.
         """
-        from datetime import datetime
-
-        renders_dir = _renders_dir()
-        renders_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
-        out = renders_dir / f"{stamp}_{safe_name}.png"
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges)
-        out.write_bytes(png)
-        # Convenience latest pointer (real file, not symlink — works on all filesystems).
-        (renders_dir / "latest.png").write_bytes(png)
-        return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
-                "renders_dir": str(renders_dir),
-                "parts": len(STATE.parts), "width": width, "height": height,
-                "color_mode": color_mode, "hidden_edges": hidden_edges}
+        summary, img = _render_to_disk_and_image(png)
+        summary.update({"parts": len(STATE.parts), "width": width, "height": height,
+                        "color_mode": color_mode, "hidden_edges": hidden_edges})
+        return [summary, img]
 
     @mcp.tool()
     def render_progress(width: int = 800, height: int = 600,
                          color_mode: str = "model",
-                         hidden_edges: bool = True) -> dict[str, Any]:
+                         hidden_edges: bool = True) -> list:
         """Render the build-in-progress: parts in STATE.built render normally,
-        unbuilt parts show as ghosts (washed-out, no studs). Use this in a
-        builder loop to see what's been placed vs what's still to come.
-
-        Writes to the same renders dir as render_model (see its docstring).
+        unbuilt parts show as ghosts (washed-out, no studs). Returns BOTH the
+        image (inline for the LLM) AND a summary dict with built/total counts.
         """
-        from datetime import datetime
-        renders_dir = _renders_dir()
-        renders_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
-        out = renders_dir / f"{stamp}_{safe_name}_progress.png"
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges,
                                built_set=STATE.built)
-        out.write_bytes(png)
-        (renders_dir / "latest.png").write_bytes(png)
-        return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
-                "renders_dir": str(renders_dir),
-                "built": len(STATE.built), "total": len(STATE.parts),
-                "width": width, "height": height}
+        summary, img = _render_to_disk_and_image(png, name_suffix="_progress")
+        summary.update({"built": len(STATE.built), "total": len(STATE.parts),
+                        "width": width, "height": height})
+        return [summary, img]
+
+    @mcp.tool()
+    def view_latest_render() -> list:
+        """Return the most recent render as an inline image. Useful if you've
+        navigated away from a render call or want to see the current state
+        without re-rendering."""
+        latest = _renders_dir() / "latest.png"
+        if not latest.is_file():
+            return [{"ok": False, "reason": "no render yet — call render_model first"}]
+        png = latest.read_bytes()
+        return [{"ok": True, "path": str(latest), "bytes": len(png)},
+                MCPImage(data=png, format="png")]
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
 

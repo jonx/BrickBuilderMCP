@@ -135,16 +135,19 @@ def test_end_builder_session_marks_all_built_by_default():
 
 
 def test_render_progress_writes_a_png(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     base, top = _stack_two_bricks()
     server.start_builder_session()
     server.mark_built(base)
-    r = server.render_progress(width=400, height=300)
-    assert r["ok"]
+    result = server.render_progress(width=400, height=300)
+    # New shape: [summary, MCPImage]
+    summary, image = result
+    assert summary["ok"]
     from pathlib import Path
-    p = Path(r["path"])
+    p = Path(summary["path"])
     assert p.exists()
     assert p.read_bytes().startswith(b"\x89PNG")
-    assert r["built"] == 1
-    assert r["total"] == 2
+    assert image.data.startswith(b"\x89PNG")
+    assert summary["built"] == 1
+    assert summary["total"] == 2

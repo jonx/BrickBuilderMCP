@@ -167,15 +167,38 @@ def _stud_positions_local(part) -> list[tuple[float, float, float]]:
     return out
 
 
-def _stud_disc_corners(cx: float, cy: float, cz: float) -> list[tuple[float, float, float]]:
-    """A flat circle (polygon) at the TOP of a stud cylinder, in world coords."""
-    top_y = cy - STUD_HEIGHT  # studs rise toward -Y
+def _stud_ring(cx: float, cy: float, cz: float, radius: float
+                ) -> list[tuple[float, float, float]]:
+    """N-gon ring at one Y height in world coords."""
     return [
-        (cx + STUD_RADIUS * math.cos(2 * math.pi * i / STUD_CIRCLE_SIDES),
-         top_y,
-         cz + STUD_RADIUS * math.sin(2 * math.pi * i / STUD_CIRCLE_SIDES))
+        (cx + radius * math.cos(2 * math.pi * i / STUD_CIRCLE_SIDES),
+         cy,
+         cz + radius * math.sin(2 * math.pi * i / STUD_CIRCLE_SIDES))
         for i in range(STUD_CIRCLE_SIDES)
     ]
+
+
+def _stud_disc_corners(cx: float, cy: float, cz: float) -> list[tuple[float, float, float]]:
+    """A flat circle (polygon) at the TOP of a stud cylinder, in world coords."""
+    return _stud_ring(cx, cy - STUD_HEIGHT, cz, STUD_RADIUS)
+
+
+def _stud_side_quads(cx: float, cy: float, cz: float
+                      ) -> list[list[tuple[float, float, float]]]:
+    """The cylindrical SIDE of a stud, as N quads forming the band from
+    brick top (cy) up to the disc top (cy - STUD_HEIGHT).
+
+    Each segment is one quad whose two pairs of corners share the same XZ
+    but differ in Y. The painter sort handles which segments are camera-facing.
+    """
+    base_ring = _stud_ring(cx, cy, cz, STUD_RADIUS)
+    top_ring = _stud_ring(cx, cy - STUD_HEIGHT, cz, STUD_RADIUS)
+    quads: list[list[tuple[float, float, float]]] = []
+    n = STUD_CIRCLE_SIDES
+    for i in range(n):
+        j = (i + 1) % n
+        quads.append([base_ring[i], base_ring[j], top_ring[j], top_ring[i]])
+    return quads
 
 
 def render_model_png(
@@ -314,19 +337,25 @@ def render_model_png(
                         length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # south/front
             _emit_edge(south)
 
-        # Studs on top, if applicable. Each stud is a small disc at the top of
-        # a 4-LDU-tall cylinder. We project the disc as a polygon and feed it
-        # to the painter sort so stacked bricks correctly cover studs below.
+        # Studs on top. Each stud is a real 4-LDU-tall, 6-LDU-radius cylinder:
+        # we emit a TOP DISC (the cap) plus the cylindrical SIDE BAND so the
+        # stud reads as a tube anchored to the brick. Without the side band
+        # the cap would appear visually shifted past the brick's back/right
+        # edges (its 4-LDU lift in y projects to a screen_y offset that pulls
+        # the disc past the projected top-face edges).
         rot = resolve_rotation(inst.rotation)
-        # Studs slightly brighter than the top face so they read as raised.
-        # Ghost parts skip studs entirely (the wash-out is the ghost cue).
-        stud_fill = _shade(rgb, 1.25)
+        cap_fill = _shade(rgb, 1.25)        # cap face: brightest
+        side_fill = _shade(rgb, 0.65)       # cylinder side: noticeably darker so it reads as a tube
         if not top_covers and not is_ghost:
             for sx_local, sy_local, sz_local in _stud_positions_local(part):
                 wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
                 world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
-                disc = _stud_disc_corners(*world_center)
-                _emit_face(disc, stud_fill)
+                # Cylinder side first (sorted later by painter — back-facing
+                # segments will draw behind the cap and the brick top).
+                for quad in _stud_side_quads(*world_center):
+                    _emit_face(quad, side_fill)
+                # Top cap on top.
+                _emit_face(_stud_disc_corners(*world_center), cap_fill)
 
     if not all_proj:
         buf = io.BytesIO()

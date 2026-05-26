@@ -96,6 +96,91 @@ def register_prompts(mcp) -> None:
     """Attach all LegoMCP prompts to a FastMCP instance."""
 
     @mcp.prompt(
+        name="start",
+        title="LegoMCP — getting started",
+        description="One-page reference: tools you have, save/snapshot/builder workflow, coordinate convention.",
+    )
+    def start() -> list[dict]:
+        """Open this first. Tells the LLM how the toolchain is wired."""
+        return [_user(f"""\
+You're driving the **LegoMCP** server. Below is the full toolbox + the workflow that gets the best results.
+
+{COORDS_BLURB}
+
+## Building tools (in order of preference)
+
+**High-level helpers** — use these first; they handle stagger / corners / fits:
+- `build_room(x_min, z_min, x_max, z_max, height_rows, color, base_y)` — 4 walls + corner columns.
+- `build_wall_segment(x0, z0, x1, z1, height_rows, color, base_y)` — one straight wall with running-bond stagger.
+- `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` — tile a rectangle.
+- `place_on_top(base_id, new_part_id, color, stud_offset_x, stud_offset_z, rotation)` — stud-grid stacking.
+- `place_next_to(reference_id, new_part_id, color, side, offset, rotation)` — flush placement.
+
+**Catalog search**:
+- `search_parts(query)` — keyword search. Use single concrete words ("arch", "wheel", "window"). Multi-token AND-search; "vehicle base car chassis" returns nothing.
+- `get_part_info(part_id)` — dimensions + for slopes, the `orientation` block tells you where the HIGH edge is in identity rotation. Use this before placing a slope.
+- `parts_that_mount_on(part_id, limit=20)` — reverse search: "what can sit on top of THIS?" Indexed across the full catalog.
+- `find_connections(a, b)` — every valid placement of B-on-A and A-on-B.
+
+**Raw / debug** (avoid unless helpers don't fit):
+- `add_part(part_id, color, x, y, z, rotation, strict=False)` — explicit placement. `strict=True` rejects collisions/floating.
+
+## See what you built — IMPORTANT
+
+- `render_model()` returns an **inline image** you can see in the tool response, plus writes a timestamped PNG to disk. Use this often — placement is hard to reason about from coordinates alone.
+- `render_progress()` — same but for builder mode (built parts solid, unbuilt as ghosts).
+- `view_latest_render()` — re-show the most recent render without re-rendering.
+
+## Validate as you build
+
+After every ~20 placements, call `validate_model()`. The 9-field report tells you collisions, floating, unanchored, grid-alignment errors, vertical seam score, wall-bond quality. **Errors include a `suggestion` field** — read it, apply it, don't push through.
+
+## Save snapshots — you have THREE levels
+
+| Tool | When to use |
+|---|---|
+| `save_checkpoint(name)` / `restore_checkpoint(name)` | In-memory, instant. Use BEFORE risky changes (mirror, big helper call, restructuring). Lost on server restart. |
+| `save_project(name)` / `load_project(name)` / `list_projects()` | On-disk, named. Survives restart. Use for "this is a real intermediate I want to keep." |
+| **autosave** is automatic every 25 mutations. `restore_autosave()` brings it back after a crash. `autosave_status()` shows when the next save will fire. |
+
+Pattern: `save_checkpoint("before_X")` → try X → if happy, continue / if not, `restore_checkpoint("before_X")`.
+
+## Builder mode (place-one-piece-at-a-time workflow)
+
+When you have a complete target model and want to walk through assembling it (or have a human/robot build it):
+
+1. Build the full target with helpers / add_part. Validate it.
+2. `start_builder_session()` — snapshot becomes the target; built set clears.
+3. Loop: `builder_status()` → see `next_up` → place that part → `mark_built(id)` → `render_progress()` to verify.
+4. `end_builder_session()` when done.
+
+## Subassemblies (organizing scale)
+
+For models past ~50 parts:
+- `set_current_subassembly("nave")` — tag subsequent additions.
+- `clone_subassembly(src, dst, x_offset, y_offset, z_offset)` — duplicate a built component.
+- `mirror_subassembly(src, dst, axis)` — bilateral symmetry. Cathedral fronts, vehicles.
+- `list_subassemblies()` — names + counts.
+
+## Notes (sticky observations across turns)
+
+For multimodal workflows where you're consulting an uploaded plan:
+- `add_note(key, text)` — record a measurement / decision.
+- `list_notes()` / `get_note(key)` — recall.
+
+Notes travel with the project (saved by `save_project`).
+
+{TECHNIQUES_BLURB}
+
+## Start NOW with
+
+1. Ask the user what they want to build (if not stated).
+2. `create_model("<short_name>")`.
+3. Place a baseplate (`3811` = 32x32, top y=-4) or skip if not appropriate.
+4. Use high-level helpers + `validate_model` + `render_model` in a loop.
+""")]
+
+    @mcp.prompt(
         name="build",
         title="Build a LEGO model",
         description="Start a fresh LegoMCP session with a build goal.",

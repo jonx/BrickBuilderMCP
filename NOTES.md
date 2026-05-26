@@ -55,6 +55,47 @@ None of these change Phase 1 *yet*, but I want the seams to exist:
 - Should `validate_model` block mutations on collision, or always allow + report?
 - Built-in catalog: which 30 parts? Currently leaning toward classic City-set bricks.
 
+## Usability iteration (post-Claude-Desktop feedback)
+
+Real LLM usage in Claude Desktop surfaced 7 friction points. Addressed:
+
+- **`render_model` / `render_progress` now return the actual PNG to the LLM**
+  (`[summary_dict, MCPImage]`). Was the biggest blocker — the LLM was
+  building blind, reasoning from coordinates only. Disk write still happens
+  for the user's history. New `view_latest_render` tool re-views without
+  re-rendering.
+- **Plate height bug fixed.** Plate 2x4 had been reporting `height_ldu=1`
+  instead of 8. Root cause: `_collect_vertices` had two bugs (same ones
+  I'd already fixed in `_extract_studs`) — a `visited` set blocked
+  legitimate repeated primitive refs (`box5` and `stud4` are referenced
+  many times per plate), and it didn't try `p/` for primitive resolution.
+  After re-index: 24,009 parts (up from 23,209 because the deeper
+  recursion reaches more).
+- **`get_part_info` exposes slope orientation.** For slope-named parts it
+  reports `high_edge: "+Z"`, `low_edge: "-Z"`, derived from stud centroid
+  vs bbox centroid. Also exposes raw `bbox_local` (min/max corners) for
+  general reasoning. Means the LLM doesn't have to guess where the high
+  edge ends up after rotation.
+- **`parts_that_mount_on(part_id)`** — reverse mount search, indexed over
+  the full 24k catalog. Footprint-bucketed so query stays ~ms after the
+  ~1s first-call build.
+- **Autosave every 25 mutations.** Hooked into `_record()`. Atomic write
+  via `.tmp` rename. Companion: `restore_autosave()`, `autosave_status()`.
+- **New `start` prompt** — one-page reference covering the full toolbox +
+  the build/validate/render loop + the three save tiers
+  (checkpoint / project / autosave) + builder mode. Invokable from
+  Claude Desktop's slash menu.
+
+Deferred to next iteration:
+- **Slope geometry in the renderer.** Still draws slopes as cuboids. The
+  orientation hint in `get_part_info` covers the most important case
+  (knowing where the high edge is). True wedge rendering is a bigger
+  per-slope geometric piece — pick up when there's a concrete model that
+  needs visual slope verification.
+- **Semantic search.** "vehicle base car chassis" still returns 0
+  (AND-of-tokens). Needs category tagging or LLM-based reformulation.
+  Workaround: query with single concrete words.
+
 ## Known limitations after the buildability work
 
 - **General outline bonding is a first pass.** `build_perimeter(points=...)`

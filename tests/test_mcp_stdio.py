@@ -69,12 +69,15 @@ def test_server_initializes_and_calls_tool():
             "export_ldr", "export_mpd", "import_ldr",
             "undo", "redo",
             "save_checkpoint", "restore_checkpoint",
-            "render_model",  # only registers if Pillow is importable
+            "render_model", "view_latest_render",  # require Pillow
             "build_wall", "build_perimeter", "build_room",
             "build_wall_with_openings", "build_stepped_gable_roof",
             "build_stepped_pyramid_roof",
             "analyze_assembly_ports", "find_subassembly_connections", "move_subassembly",
             "plan_build_sequence", "next_build_step",
+            # New in this iteration
+            "parts_that_mount_on", "restore_autosave", "autosave_status",
+            "start_builder_session", "mark_built", "builder_status",
         ]:
             assert required in names, f"tool {required!r} not exposed; got {names}"
 
@@ -82,7 +85,7 @@ def test_server_initializes_and_calls_tool():
         _send(proc, {"jsonrpc": "2.0", "id": 25, "method": "prompts/list"})
         resp = _read_until(proc, 25)
         prompt_names = {p["name"] for p in resp["result"]["prompts"]}
-        for expected in ("build", "from_plans", "from_image", "rescue", "techniques"):
+        for expected in ("start", "build", "from_plans", "from_image", "rescue", "techniques"):
             assert expected in prompt_names, f"prompt {expected!r} missing; got {prompt_names}"
 
         # 3c. list resources — verify the reference resources are exposed.

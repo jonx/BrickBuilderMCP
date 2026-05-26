@@ -1,45 +1,73 @@
-"""Renderer smoke. Renders go to a temp dir, not the project renders/ folder."""
+"""Renderer smoke. Renders return [summary_dict, MCPImage] so the LLM
+sees the image inline and the human gets the disk path."""
 
 from __future__ import annotations
 
-import os
+from mcp.server.fastmcp import Image as MCPImage
 
 from lego_mcp import server
 
 
-def test_renderer_produces_png(tmp_path, monkeypatch):
-    # Override the renders dir so the test doesn't pollute the user's home.
+def _summary_and_image(result):
+    """Pull the dict and MCPImage out of a render tool's [dict, image] return."""
+    summary, image = result
+    assert isinstance(summary, dict)
+    assert isinstance(image, MCPImage)
+    return summary, image
+
+
+def test_render_returns_summary_dict_and_image(tmp_path, monkeypatch):
     monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)
     server.add_part("3001", "blue", 0, -24, 0)
     server.add_part("3024", "yellow", 40, 0, 0)
-    r = server.render_model(400, 300)
-    assert r["ok"]
+    summary, image = _summary_and_image(server.render_model(400, 300))
+    assert summary["ok"]
+    assert image.data.startswith(b"\x89PNG")
+    assert summary["bytes"] == len(image.data)
     from pathlib import Path
-    p = Path(r["path"])
+    p = Path(summary["path"])
     assert p.exists()
     assert p.stat().st_size > 1000
-    assert p.read_bytes().startswith(b"\x89PNG")
-    # Sanity: written under the overridden renders dir.
     assert str(p).startswith(str(tmp_path))
 
 
-def test_renderer_empty_model(tmp_path, monkeypatch):
+def test_render_empty_model_still_returns_image(tmp_path, monkeypatch):
     monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
-    r = server.render_model(200, 150)
-    assert r["ok"]
+    summary, image = _summary_and_image(server.render_model(200, 150))
+    assert summary["ok"]
+    assert image.data.startswith(b"\x89PNG")
 
 
-def test_renderer_debug_color_modes(tmp_path, monkeypatch):
+def test_render_debug_color_modes(tmp_path, monkeypatch):
     monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)
     server.add_part("3001", "red", 40, -24, 0)
-    r = server.render_model(400, 300, color_mode="row", hidden_edges=True)
-    assert r["ok"]
-    assert r["color_mode"] == "row"
-    assert r["hidden_edges"] is True
+    summary, _ = _summary_and_image(
+        server.render_model(400, 300, color_mode="row", hidden_edges=True)
+    )
+    assert summary["color_mode"] == "row"
+    assert summary["hidden_edges"] is True
     from pathlib import Path
-    assert Path(r["latest"]).exists()
+    assert Path(summary["latest"]).exists()
+
+
+def test_view_latest_render_returns_existing_png(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
+    server.create_model()
+    server.add_part("3001", "red", 0, 0, 0)
+    server.render_model(200, 150)
+    result = server.view_latest_render()
+    summary, image = _summary_and_image(result)
+    assert summary["ok"]
+    assert image.data.startswith(b"\x89PNG")
+
+
+def test_view_latest_render_without_prior_render(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
+    result = server.view_latest_render()
+    assert isinstance(result, list)
+    assert result[0]["ok"] is False
