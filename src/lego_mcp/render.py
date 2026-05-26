@@ -157,6 +157,18 @@ def render_model_png(
 
     from lego_mcp.server import matrix_apply, resolve_rotation
 
+    # Outlines are emitted as separate "outline polygons" with no fill, at the
+    # face's centroid depth. They sort with the sub-fills in the painter loop,
+    # so faces in front correctly cover the outlines of parts behind them.
+    outlines: list[tuple[float, list[tuple[float, float]], tuple[int, int, int]]] = []
+    OUTLINE_RGB = (40, 40, 40)
+
+    def _emit_outline(corners3d: list[tuple[float, float, float]]) -> None:
+        closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
+        screen = [_project(*c) for c in corners3d]
+        outlines.append((closeness, screen, OUTLINE_RGB))
+        all_proj.extend(screen)
+
     for inst in parts.values():
         part = index.get(inst.part_id)
         if part is None:
@@ -173,6 +185,16 @@ def render_model_png(
                     length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # right
         _split_rect(p0=(xmin, ymin, zmax), du=(w, 0, 0), dv=(0, h, 0),
                     length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # front
+
+        # Per-face perimeter outlines at face centroid depth (occlusion-correct
+        # within a single brick; may slightly bleed when two bricks of similar
+        # depth overlap — acceptable for the debug-aid use case).
+        _emit_outline([(xmin, ymin, zmin), (xmax, ymin, zmin),
+                       (xmax, ymin, zmax), (xmin, ymin, zmax)])  # top
+        _emit_outline([(xmax, ymin, zmin), (xmax, ymin, zmax),
+                       (xmax, ymax, zmax), (xmax, ymax, zmin)])  # right
+        _emit_outline([(xmin, ymin, zmax), (xmax, ymin, zmax),
+                       (xmax, ymax, zmax), (xmin, ymax, zmax)])  # front
 
         # Studs on top, if applicable. Each stud is a small disc at the top of
         # a 4-LDU-tall cylinder. We project the disc as a polygon and feed it
@@ -200,14 +222,22 @@ def render_model_png(
     off_x = margin - min(pxs) * scale + (width - 2 * margin - src_w * scale) / 2
     off_y = margin - min(pys) * scale + (height - 2 * margin - src_h * scale) / 2
 
-    # Draw all sub-faces farthest-first. Outline each sub-face in its own fill
-    # color so Pillow's rasterizer doesn't leave 1-pixel seams between adjacent
-    # subdivisions. Three shading levels (top/right/front) give the brick-face
-    # look without explicit outlines, which would overdraw through occlusion.
-    faces.sort(key=lambda f: f[0])
-    for _, screen, fill, _outline in faces:
+    # Merge sub-fills + outlines by depth and draw farthest-first.
+    # Sub-fills are tagged with fill_only=True (no outline stroke); outlines
+    # are stroke-only (no fill).
+    merged: list[tuple[float, list[tuple[float, float]], tuple[int, int, int], bool]] = []
+    for closeness, screen, fill, _ in faces:
+        merged.append((closeness, screen, fill, True))    # True = fill
+    for closeness, screen, outline_rgb in outlines:
+        merged.append((closeness, screen, outline_rgb, False))  # False = stroke
+    merged.sort(key=lambda f: f[0])
+    for _, screen, color, is_fill in merged:
         poly = [(sx * scale + off_x, sy * scale + off_y) for sx, sy in screen]
-        draw.polygon(poly, fill=fill, outline=fill)
+        if is_fill:
+            draw.polygon(poly, fill=color, outline=color)
+        else:
+            # Stroke only — close the polygon explicitly.
+            draw.line(poly + [poly[0]], fill=color, width=1)
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
