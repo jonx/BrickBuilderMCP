@@ -27,9 +27,12 @@ LDU_PER_BRICK = 24  # 3 plates
 class Part:
     """A part definition. Size is in LDU. Origin is center-bottom.
 
-    `studs` is the list of (x, y, z) positions where this part has a TOP stud,
-    in part-local coordinates. Empty for tiles, smooth-top parts, or when stud
-    geometry couldn't be parsed.
+    Connection points (all in part-local coordinates):
+    - `studs`        : up-pointing top studs (insert into something above)
+    - `antistuds`    : recessed bottom holes (something below inserts its stud)
+
+    Empty `studs` = smooth top (tile). Empty `antistuds` = solid bottom
+    (baseplates, some specialty parts).
     """
     part_id: str
     name: str
@@ -37,6 +40,7 @@ class Part:
     depth: int       # +Z extent, LDU
     height: int      # height upward (toward -Y), LDU
     studs: tuple[tuple[float, float, float], ...] = ()
+    antistuds: tuple[tuple[float, float, float], ...] = ()
 
 
 # LDraw convention: a "Brick A x B" has the LARGER dimension along +X (width)
@@ -346,27 +350,24 @@ def _matmul(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, ...]:
     return (nx, ny, nz) + nm
 
 
-def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 5
-                   ) -> list[tuple[float, float, float]]:
-    """Recursively scan a part for TOP stud positions in part-local coords.
+def _extract_connections(part_id: str, ldraw_home: Path, max_depth: int = 5
+                          ) -> tuple[list[tuple[float, float, float]],
+                                      list[tuple[float, float, float]]]:
+    """Recursively scan a part for top studs AND bottom anti-studs.
 
-    Recurses through subparts in s/ AND stud-group primitives in p/ (like
-    stug-2x2.dat which holds 4 stud.dat refs). Only keeps studs whose
-    orientation matrix has e[1][1] > 0 (stud points up in -Y direction).
-    Anti-studs (bottom connectors, e[1][1] < 0) are skipped.
+    Returns (studs, antistuds) in part-local coordinates. Studs point up
+    (e[1][1] > 0), anti-studs point down (e[1][1] < 0). Recurses through
+    subparts (s/) and stud-group primitives (p/stug-NxN.dat).
     """
     parts_dir = ldraw_home / "parts"
     s_dir = parts_dir / "s"
     p_dir = ldraw_home / "p"
-    out: list[tuple[float, float, float]] = []
+    studs: list[tuple[float, float, float]] = []
+    antistuds: list[tuple[float, float, float]] = []
 
     def walk(filename: str, transform: tuple[float, ...], depth: int) -> None:
-        # No visited-set dedup: the same primitive (e.g. stug-2x2) can legitimately
-        # be referenced from many positions in one part (a baseplate uses one stud
-        # group per 2x2 cluster). max_depth bounds runaway recursion.
         if depth > max_depth:
             return
-        # Resolve: try parts/, parts/s/, then p/ (for stud-group primitives).
         base = Path(filename).name
         path = parts_dir / filename
         if not path.is_file():
@@ -383,19 +384,25 @@ def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 5
             base = Path(fname).name
             if base in _STUD_FILES:
                 composed = _matmul(transform, values)
-                # e[1][1] = composed[7]. > 0 means stud points DOWN in part
-                # frame (+Y), which is UP in LDraw's -Y-is-up convention -> top stud.
+                # e[1][1] = composed[7]. >0: stud points up (-Y in LDraw). <0: anti-stud.
                 if composed[7] > 0:
-                    out.append((composed[0], composed[1], composed[2]))
+                    studs.append((composed[0], composed[1], composed[2]))
+                elif composed[7] < 0:
+                    antistuds.append((composed[0], composed[1], composed[2]))
             else:
-                # Always recurse — could be a subpart (s/), a stud-group
-                # primitive (p/stug-NxN.dat), or any other internal file.
                 composed = _matmul(transform, values)
                 walk(fname, composed, depth + 1)
 
     identity = (0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
     walk(f"{part_id}.dat", identity, 0)
-    return out
+    return studs, antistuds
+
+
+def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 5
+                   ) -> list[tuple[float, float, float]]:
+    """Back-compat shim: top studs only."""
+    studs, _ = _extract_connections(part_id, ldraw_home, max_depth)
+    return studs
 
 
 def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
@@ -422,6 +429,7 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
                         part_id=pid, name=p["name"],
                         width=p["width"], depth=p["depth"], height=p["height"],
                         studs=tuple(tuple(s) for s in p.get("studs", [])),
+                        antistuds=tuple(tuple(s) for s in p.get("antistuds", [])),
                     )
                     for pid, p in data.items()
                 }
@@ -435,29 +443,27 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
             continue
         name, (minx, miny, minz, maxx, maxy, maxz) = result
         part_id = dat.stem
-        # Extract real top-stud positions by recursively parsing the part.
-        # Skip on parse failure (no studs is also fine for tiles/baseplates).
         try:
-            studs = tuple(_extract_studs(part_id, home))
+            studs_list, antistuds_list = _extract_connections(part_id, home)
         except Exception:  # noqa: BLE001
-            studs = ()
+            studs_list, antistuds_list = [], []
         index[part_id] = Part(
             part_id=part_id,
             name=name,
             width=max(1, int(round(maxx - minx))),
             depth=max(1, int(round(maxz - minz))),
             height=max(1, int(round(maxy - miny))),
-            studs=studs,
+            studs=tuple(studs_list),
+            antistuds=tuple(antistuds_list),
         )
-    # The LDraw-parsed entries are authoritative; only fall back to built-ins
-    # for parts that aren't in the library.
     for pid, p in BUILTIN_PARTS.items():
         index.setdefault(pid, p)
 
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(
         {pid: {"name": p.name, "width": p.width, "depth": p.depth, "height": p.height,
-               "studs": [list(s) for s in p.studs]}
+               "studs": [list(s) for s in p.studs],
+               "antistuds": [list(s) for s in p.antistuds]}
          for pid, p in index.items()},
     ))
     return index

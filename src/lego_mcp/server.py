@@ -616,6 +616,22 @@ def list_colors() -> dict[str, Any]:
     return {"colors": [{"name": name, "id": cid} for name, (cid, _) in COLORS.items()]}
 
 
+@mcp.tool()
+def find_connections(part_a_id: str, part_b_id: str,
+                      full_nesting_only: bool = False) -> dict[str, Any]:
+    """Enumerate every valid LEGO connection between two parts.
+
+    Returns the list of relative placements where B stacks on A (and vice
+    versa) with at least one stud-to-receptor mating. Set
+    full_nesting_only=True to keep only placements where ALL of B's
+    receptors mate (i.e. B's full footprint sits inside A's stud area).
+    """
+    from lego_mcp.connections import find_connections as _find
+    a = _require_part(part_a_id)
+    b = _require_part(part_b_id)
+    return _find(a, b, full_nesting_only=full_nesting_only)
+
+
 # ---------------------------------------------------------------------------
 # Subassemblies (tag-based: every PartInstance has a subassembly name).
 # Use these to organize complex builds (cathedral mechanisms, corner towers,
