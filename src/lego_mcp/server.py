@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import math
 import re
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
@@ -83,16 +84,21 @@ class PartInstance:
 
 
 @dataclass
+class Op:
+    """A reversible mutation. Both directions are O(1)."""
+    kind: str           # "add" | "remove" | "move" | "rotate"
+    instance_id: str
+    data: dict[str, Any]
+
+
+@dataclass
 class ModelState:
     name: str = "untitled"
     parts: dict[str, PartInstance] = field(default_factory=dict)
     _next_id: int = 1
-    # Undo/redo: stacks of (description, parts-dict-snapshot).
-    # Snapshot-based (not inverse-op) for simplicity. The cost is one deepcopy per
-    # mutation; for >10k-part models this becomes the bottleneck and we'll switch
-    # to inverse ops (see NOTES.md).
-    _undo: list[tuple[str, dict[str, "PartInstance"]]] = field(default_factory=list)
-    _redo: list[tuple[str, dict[str, "PartInstance"]]] = field(default_factory=list)
+    # Op-based undo/redo: O(1) per mutation regardless of model size.
+    _undo: list[Op] = field(default_factory=list)
+    _redo: list[Op] = field(default_factory=list)
     _checkpoints: dict[str, "ModelState"] = field(default_factory=dict)
 
     def new_id(self) -> str:
@@ -104,7 +110,7 @@ class ModelState:
 STATE = ModelState()
 PART_INDEX: dict[str, Part] = dict(BUILTIN_PARTS)
 _LIBRARY_LOADED = False
-UNDO_LIMIT = 200
+UNDO_LIMIT = 500
 
 
 def _ensure_library_loaded() -> None:
@@ -113,17 +119,38 @@ def _ensure_library_loaded() -> None:
     if _LIBRARY_LOADED:
         return
     _LIBRARY_LOADED = True
-    full = load_library_index()
-    # full already includes BUILTIN_PARTS as overrides (see parts.load_library_index)
-    PART_INDEX = full
+    PART_INDEX = load_library_index()
 
 
-def _snapshot_for_undo(description: str) -> None:
-    """Record the current parts dict on the undo stack, before a mutation."""
-    STATE._undo.append((description, deepcopy(STATE.parts)))
+def _record(op: Op) -> None:
+    STATE._undo.append(op)
     STATE._redo.clear()
     if len(STATE._undo) > UNDO_LIMIT:
         STATE._undo = STATE._undo[-UNDO_LIMIT:]
+
+
+def _apply_forward(op: Op) -> None:
+    if op.kind == "add":
+        STATE.parts[op.instance_id] = deepcopy(op.data["inst"])
+    elif op.kind == "remove":
+        STATE.parts.pop(op.instance_id, None)
+    elif op.kind == "move":
+        inst = STATE.parts[op.instance_id]
+        inst.x, inst.y, inst.z = op.data["new_pos"]
+    elif op.kind == "rotate":
+        STATE.parts[op.instance_id].rotation = op.data["new_rot"]
+
+
+def _apply_inverse(op: Op) -> None:
+    if op.kind == "add":
+        STATE.parts.pop(op.instance_id, None)
+    elif op.kind == "remove":
+        STATE.parts[op.instance_id] = deepcopy(op.data["inst"])
+    elif op.kind == "move":
+        inst = STATE.parts[op.instance_id]
+        inst.x, inst.y, inst.z = op.data["old_pos"]
+    elif op.kind == "rotate":
+        STATE.parts[op.instance_id].rotation = op.data["old_rot"]
 
 
 def _require_part(part_id: str) -> Part:
@@ -299,20 +326,21 @@ def add_part(
     part = _require_part(part_id)
     cid = resolve_color(color)
     resolve_rotation(rotation)  # validate name
-    _snapshot_for_undo(f"add {part.part_id}")
     inst_id = STATE.new_id()
     inst = PartInstance(instance_id=inst_id, part_id=part.part_id, color=cid,
                         x=float(x), y=float(y), z=float(z), rotation=rotation.lower())
     STATE.parts[inst_id] = inst
+    _record(Op("add", inst_id, {"inst": deepcopy(inst)}))
     return {"ok": True, "instance_id": inst_id, "part": _inst_dict(inst)}
 
 
 @mcp.tool()
 def remove_part(instance_id: str) -> dict[str, Any]:
     """Remove a part by its instance ID. Undoable."""
-    if instance_id not in STATE.parts:
+    inst = STATE.parts.get(instance_id)
+    if inst is None:
         raise ValueError(f"No part with instance_id={instance_id!r}")
-    _snapshot_for_undo(f"remove {instance_id}")
+    _record(Op("remove", instance_id, {"inst": deepcopy(inst)}))
     STATE.parts.pop(instance_id)
     return {"ok": True, "removed": instance_id}
 
@@ -323,8 +351,10 @@ def move_part(instance_id: str, x: float, y: float, z: float) -> dict[str, Any]:
     inst = STATE.parts.get(instance_id)
     if inst is None:
         raise ValueError(f"No part with instance_id={instance_id!r}")
-    _snapshot_for_undo(f"move {instance_id}")
-    inst.x, inst.y, inst.z = float(x), float(y), float(z)
+    old_pos = (inst.x, inst.y, inst.z)
+    new_pos = (float(x), float(y), float(z))
+    inst.x, inst.y, inst.z = new_pos
+    _record(Op("move", instance_id, {"old_pos": old_pos, "new_pos": new_pos}))
     return {"ok": True, "part": _inst_dict(inst)}
 
 
@@ -335,8 +365,10 @@ def rotate_part(instance_id: str, rotation: str) -> dict[str, Any]:
     if inst is None:
         raise ValueError(f"No part with instance_id={instance_id!r}")
     resolve_rotation(rotation)
-    _snapshot_for_undo(f"rotate {instance_id}")
-    inst.rotation = rotation.lower()
+    old_rot = inst.rotation
+    new_rot = rotation.lower()
+    inst.rotation = new_rot
+    _record(Op("rotate", instance_id, {"old_rot": old_rot, "new_rot": new_rot}))
     return {"ok": True, "part": _inst_dict(inst)}
 
 
@@ -384,31 +416,77 @@ def list_colors() -> dict[str, Any]:
     return {"colors": [{"name": name, "id": cid} for name, (cid, _) in COLORS.items()]}
 
 
+CELL_SIZE = 80.0  # LDU. Picked to roughly match a 2x4 brick footprint.
+
+
+def _cell_keys(aabb: tuple) -> list[tuple[int, int, int]]:
+    """Grid cells an AABB occupies. Used to bucket parts for O(n) collision."""
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
+    ix0 = int(math.floor(xmin / CELL_SIZE))
+    ix1 = int(math.floor((xmax - 1e-6) / CELL_SIZE))
+    iy0 = int(math.floor(ymin / CELL_SIZE))
+    iy1 = int(math.floor((ymax - 1e-6) / CELL_SIZE))
+    iz0 = int(math.floor(zmin / CELL_SIZE))
+    iz1 = int(math.floor((zmax - 1e-6) / CELL_SIZE))
+    return [(ix, iy, iz)
+            for ix in range(ix0, ix1 + 1)
+            for iy in range(iy0, iy1 + 1)
+            for iz in range(iz0, iz1 + 1)]
+
+
 @mcp.tool()
-def validate_model() -> dict[str, Any]:
-    """Check for unknown parts and AABB collisions. Returns a structured report."""
+def validate_model(max_errors: int = 200) -> dict[str, Any]:
+    """Check for unknown parts and AABB collisions. Returns a structured report.
+
+    Uses spatial grid bucketing so collision detection scales to thousands of
+    parts (we only test pairs that share at least one ~2x4-brick cell).
+    Caps the returned error list at `max_errors`; counts still cover everything.
+    """
     errors: list[dict[str, Any]] = []
+    unknown_count = 0
     aabbs: dict[str, tuple] = {}
     for inst in STATE.parts.values():
         part = PART_INDEX.get(inst.part_id)
         if part is None:
-            errors.append({"type": "unknown_part", "part_id": inst.part_id,
-                           "instance_id": inst.instance_id})
+            unknown_count += 1
+            if len(errors) < max_errors:
+                errors.append({"type": "unknown_part", "part_id": inst.part_id,
+                               "instance_id": inst.instance_id})
             continue
         aabbs[inst.instance_id] = part_aabb_world(inst, part)
-    ids = list(aabbs.keys())
-    for i, a in enumerate(ids):
-        for b in ids[i + 1:]:
-            if aabbs_overlap(aabbs[a], aabbs[b]):
-                errors.append({"type": "collision", "instance_a": a, "instance_b": b,
-                               "note": "AABB-based; tiles on studs may falsely overlap."})
+
+    grid: dict[tuple[int, int, int], list[str]] = {}
+    for iid, ab in aabbs.items():
+        for key in _cell_keys(ab):
+            grid.setdefault(key, []).append(iid)
+
+    checked: set[tuple[str, str]] = set()
+    collision_count = 0
+    for ids in grid.values():
+        if len(ids) < 2:
+            continue
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                pair = (a, b) if a < b else (b, a)
+                if pair in checked:
+                    continue
+                checked.add(pair)
+                if aabbs_overlap(aabbs[a], aabbs[b]):
+                    collision_count += 1
+                    if len(errors) < max_errors:
+                        errors.append({"type": "collision", "instance_a": a,
+                                       "instance_b": b,
+                                       "note": "AABB-based; corner-touching tiles may falsely overlap."})
+
     return {
-        "valid": not errors,
+        "valid": collision_count == 0 and unknown_count == 0,
         "errors": errors,
         "summary": {
             "parts": len(STATE.parts),
-            "collisions": sum(1 for e in errors if e["type"] == "collision"),
-            "unknown_parts": sum(1 for e in errors if e["type"] == "unknown_part"),
+            "collisions": collision_count,
+            "unknown_parts": unknown_count,
+            "errors_truncated": collision_count + unknown_count > len(errors),
         },
     }
 
@@ -444,10 +522,10 @@ def undo() -> dict[str, Any]:
     """Undo the last mutation."""
     if not STATE._undo:
         return {"ok": False, "reason": "nothing to undo"}
-    desc, prev_parts = STATE._undo.pop()
-    STATE._redo.append((desc, deepcopy(STATE.parts)))
-    STATE.parts = prev_parts
-    return {"ok": True, "undone": desc, "parts": len(STATE.parts)}
+    op = STATE._undo.pop()
+    _apply_inverse(op)
+    STATE._redo.append(op)
+    return {"ok": True, "undone": f"{op.kind} {op.instance_id}", "parts": len(STATE.parts)}
 
 
 @mcp.tool()
@@ -455,10 +533,10 @@ def redo() -> dict[str, Any]:
     """Redo the last undone mutation."""
     if not STATE._redo:
         return {"ok": False, "reason": "nothing to redo"}
-    desc, next_parts = STATE._redo.pop()
-    STATE._undo.append((desc, deepcopy(STATE.parts)))
-    STATE.parts = next_parts
-    return {"ok": True, "redone": desc, "parts": len(STATE.parts)}
+    op = STATE._redo.pop()
+    _apply_forward(op)
+    STATE._undo.append(op)
+    return {"ok": True, "redone": f"{op.kind} {op.instance_id}", "parts": len(STATE.parts)}
 
 
 @mcp.tool()
