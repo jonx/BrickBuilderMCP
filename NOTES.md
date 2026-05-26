@@ -55,6 +55,25 @@ None of these change Phase 1 *yet*, but I want the seams to exist:
 - Should `validate_model` block mutations on collision, or always allow + report?
 - Built-in catalog: which 30 parts? Currently leaning toward classic City-set bricks.
 
+## Known limitations after the buildability work
+
+- **Corner bonding in `build_room` isn't proper LEGO masonry.** The corner
+  blocks are a vertical column of 2x2 bricks that only bond up/down, not
+  sideways into the perpendicular walls. Real masonry alternates the bond
+  per row: row 0 has the X-wall reaching the corner; row 1 the Z-wall. To
+  implement: `build_room` would need to place corner bricks WITH a rotation
+  alternating per row, and the inset on perpendicular walls would similarly
+  need to alternate. Workaround for now: build walls + corner pieces manually
+  for any structure where corner strength matters.
+- **`MIN_SUPPORT_AREA = 400 LDU²` is one full stud overlap.** Real LEGO
+  studs are circular (~6 LDU radius); my check uses axis-aligned XZ
+  rectangles. A part with 400 LDU² of rectangular overlap definitely has a
+  full stud's worth of clutch; under-400 might still have partial overlap.
+  Acceptable for now.
+- **No half-stud / jumper-plate support.** All placements snap to integer
+  LDU positions; the LLM can use 8-LDU plate offsets vertically but
+  horizontal half-stud offsets (jumper plates) aren't a first-class concept.
+
 ## Self-test findings (Phase 1)
 
 I built a tiny house (46 parts), a gothic tower (72 parts), a 4-tower castle

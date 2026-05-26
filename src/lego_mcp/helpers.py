@@ -101,6 +101,69 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
             "bond": bond, "subassembly": s.STATE.current_subassembly}
 
 
+def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
+               height_rows: int = 5,
+               color: str | int = "light_bluish_gray",
+               bond: str = "running",
+               base_y: float = -1,
+               brick_part: str = "3001",
+               corner_part: str = "3003",
+               ) -> dict[str, Any]:
+    """Build a rectangular hollow room: 4 walls + 2x2 corner stacks.
+
+    Walls use `build_wall` with inset ends; 2x2 corner blocks (3003) fill the
+    gap at each corner so the AABB perimeter is closed.
+
+    LIMITATION: the corner blocks form vertical columns that don't side-bond
+    into the perpendicular walls — they're connected to the corner block
+    below/above only. Real LEGO masonry alternates the corner: row 0 has the
+    X-wall extending into the corner; row 1 has the Z-wall doing so. This
+    helper doesn't yet do that alternating bond. For a structurally-correct
+    cathedral corner you currently need to place the corner pieces manually,
+    alternating their rotation per row. (Tracked in NOTES.md.)
+
+    Defaults assume the room sits on a baseplate at y=0 (top y=-1).
+    """
+    s = _server()
+    wall_thickness = 40  # one 2x4 brick rotated short-side
+    inset = wall_thickness / 2
+
+    # 2x4 corner bricks alternate rotation per row, so on even rows they extend
+    # 80 LDU into the X walls and on odd rows 80 LDU into the Z walls. The
+    # walls inset 40 LDU on each end to leave room for the corner brick's
+    # protrusion — creating an interlocked bond instead of stand-alone corner
+    # columns.
+    corner_long_half = 40   # half of the corner brick's long dimension
+    inset = corner_long_half
+
+    wall_results = [
+        build_wall(x_min, z_min, x_max, z_min, height_rows, color, bond,
+                   brick_part, base_y, inset_ends=inset),
+        build_wall(x_min, z_max, x_max, z_max, height_rows, color, bond,
+                   brick_part, base_y, inset_ends=inset),
+        build_wall(x_min, z_min, x_min, z_max, height_rows, color, bond,
+                   brick_part, base_y, inset_ends=inset),
+        build_wall(x_max, z_min, x_max, z_max, height_rows, color, bond,
+                   brick_part, base_y, inset_ends=inset),
+    ]
+    wall_bricks = sum(w.get("bricks", 0) for w in wall_results)
+
+    BRICK_H = 24
+    corners = [(x_min, z_min), (x_max, z_min), (x_min, z_max), (x_max, z_max)]
+    corner_count = 0
+    for (cx, cz) in corners:
+        for row in range(height_rows):
+            y = base_y - row * BRICK_H
+            # Alternate the long axis per row so the corner brick wraps into
+            # alternating walls — real masonry corner bond.
+            rotation = "identity" if row % 2 == 0 else "rot90y"
+            s.add_part("3001", color, cx, y, cz, rotation=rotation)
+            corner_count += 1
+
+    return {"ok": True, "wall_bricks": wall_bricks, "corner_bricks": corner_count,
+            "subassembly": s.STATE.current_subassembly}
+
+
 def build_floor(x_min: float, z_min: float, x_max: float, z_max: float,
                 y: float = -4,
                 color: str | int = "light_bluish_gray",
@@ -160,5 +223,6 @@ def repeat_pattern(part_id: str, count: int,
 def register_helpers(mcp) -> None:
     """Attach the helper tools to a FastMCP instance."""
     mcp.tool()(build_wall)
+    mcp.tool()(build_room)
     mcp.tool()(build_floor)
     mcp.tool()(repeat_pattern)
