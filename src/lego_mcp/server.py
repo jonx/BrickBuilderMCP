@@ -201,6 +201,37 @@ def aabbs_overlap(a: tuple, b: tuple, tolerance: float = 0.5) -> bool:
     return True
 
 
+def xz_overlap_area(a: tuple, b: tuple) -> float:
+    """Overlap area of two AABBs in the XZ plane, in LDU²."""
+    (amin, amax), (bmin, bmax) = a, b
+    dx = min(amax[0], bmax[0]) - max(amin[0], bmin[0])
+    dz = min(amax[2], bmax[2]) - max(amin[2], bmin[2])
+    return max(0.0, dx) * max(0.0, dz)
+
+
+GROUND_Y = 0.0          # LDU. The "ground plane" where unsupported parts can rest.
+SUPPORT_TOL = 0.5       # LDU. Vertical gap tolerance for considering "touching".
+# A real LEGO connection needs at least one stud's worth of overlap (the stud
+# is what mates with the part above's anti-stud). One stud's footprint = 20x20
+# LDU = 400 LDU². If the XZ-interface area is below this, the parts touch but
+# don't actually clutch — physically equivalent to a floating brick.
+MIN_SUPPORT_AREA = 400.0
+
+
+def _check_supported(inst_aabb: tuple, neighbor_aabbs: list[tuple]) -> bool:
+    """True if `inst_aabb` is grounded or sits on at least one neighbor's top face."""
+    _, (_, inst_bottom_y, _) = inst_aabb  # bottom face Y == aabb.max y (since -Y is up)
+    if abs(inst_bottom_y - GROUND_Y) < SUPPORT_TOL:
+        return True
+    for n in neighbor_aabbs:
+        (_, n_top_y, _), _ = n  # neighbor's top face Y == aabb.min y
+        if abs(n_top_y - inst_bottom_y) > SUPPORT_TOL:
+            continue
+        if xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # LDraw read / write
 # ---------------------------------------------------------------------------
@@ -433,6 +464,7 @@ def add_part(
     y: float = 0,
     z: float = 0,
     rotation: str = "identity",
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Place a brick. Returns the new instance_id.
 
@@ -441,17 +473,44 @@ def add_part(
         color: Color name (e.g. "red") or LDraw color ID (e.g. 4).
         x, y, z: Position in LDU. Origin = center of part's bottom face. **-Y is up.**
         rotation: One of identity, rot90y, rot180y, rot270y, rot90x, rot90z.
+        strict: If True, REJECT the placement when it would overlap an existing
+            part or have no support below (no baseplate / brick beneath, no
+            ground at y=0). Use this when you want the model to be physically
+            buildable as you go, instead of catching problems later in
+            validate_model.
     """
     part = _require_part(part_id)
     cid = resolve_color(color)
     resolve_rotation(rotation)  # validate name
+    candidate = PartInstance(
+        instance_id="_pending", part_id=part.part_id, color=cid,
+        x=float(x), y=float(y), z=float(z), rotation=rotation.lower(),
+        subassembly=STATE.current_subassembly,
+    )
+    if strict:
+        cand_aabb = part_aabb_world(candidate, part)
+        neighbor_aabbs: list[tuple] = []
+        for other in STATE.parts.values():
+            other_part = PART_INDEX.get(other.part_id)
+            if other_part is None:
+                continue
+            other_aabb = part_aabb_world(other, other_part)
+            if aabbs_overlap(cand_aabb, other_aabb):
+                raise ValueError(
+                    f"strict: would collide with instance {other.instance_id} "
+                    f"({other.part_id} at {other.x},{other.y},{other.z})"
+                )
+            neighbor_aabbs.append(other_aabb)
+        if not _check_supported(cand_aabb, neighbor_aabbs):
+            raise ValueError(
+                f"strict: no support below at ({x},{y},{z}). Need a baseplate / "
+                f"brick at top face y={cand_aabb[1][1]}, or y must be at ground (0)."
+            )
     inst_id = STATE.new_id()
-    inst = PartInstance(instance_id=inst_id, part_id=part.part_id, color=cid,
-                        x=float(x), y=float(y), z=float(z), rotation=rotation.lower(),
-                        subassembly=STATE.current_subassembly)
-    STATE.parts[inst_id] = inst
-    _record(Op("add", inst_id, {"inst": deepcopy(inst)}))
-    return {"ok": True, "instance_id": inst_id, "part": _inst_dict(inst)}
+    candidate.instance_id = inst_id
+    STATE.parts[inst_id] = candidate
+    _record(Op("add", inst_id, {"inst": deepcopy(candidate)}))
+    return {"ok": True, "instance_id": inst_id, "part": _inst_dict(candidate)}
 
 
 @mcp.tool()
@@ -691,12 +750,18 @@ def _cell_keys(aabb: tuple) -> list[tuple[int, int, int]]:
 
 
 @mcp.tool()
-def validate_model(max_errors: int = 200) -> dict[str, Any]:
-    """Check for unknown parts and AABB collisions. Returns a structured report.
+def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[str, Any]:
+    """Check for unknown parts, AABB collisions, and (optionally) floating parts.
 
-    Uses spatial grid bucketing so collision detection scales to thousands of
-    parts (we only test pairs that share at least one ~2x4-brick cell).
-    Caps the returned error list at `max_errors`; counts still cover everything.
+    Spatial grid bucketing keeps collision detection O(n) even at thousands of
+    parts. Floating-part detection uses the same grid to find which parts could
+    support each candidate (vertical neighbors with >= 1 stud of XZ overlap).
+    A part is "supported" if it sits on the ground plane (y=0) or on at least
+    one stud of another part below.
+
+    Args:
+        max_errors: cap on the returned error list. Counts still cover everything.
+        check_support: include floating-part errors.
     """
     errors: list[dict[str, Any]] = []
     unknown_count = 0
@@ -735,14 +800,40 @@ def validate_model(max_errors: int = 200) -> dict[str, Any]:
                                        "instance_b": b,
                                        "note": "AABB-based; corner-touching tiles may falsely overlap."})
 
+    floating_count = 0
+    if check_support:
+        for iid, ab in aabbs.items():
+            # Candidate supporters: parts in the same XZ cells, at the right Y.
+            # We use the same grid to find vertical neighbors quickly.
+            cand_ids = set()
+            for key in _cell_keys(ab):
+                for other in grid.get(key, []):
+                    if other != iid:
+                        cand_ids.add(other)
+            neighbor_aabbs = [aabbs[c] for c in cand_ids if c in aabbs]
+            # Also check cells DIRECTLY below (one cell down in Y).
+            (_, ymin, _), (_, ymax, _) = ab
+            for key in _cell_keys(((ab[0][0], ymax, ab[0][2]),
+                                    (ab[1][0], ymax + CELL_SIZE, ab[1][2]))):
+                for other in grid.get(key, []):
+                    if other != iid:
+                        neighbor_aabbs.append(aabbs[other])
+            if not _check_supported(ab, neighbor_aabbs):
+                floating_count += 1
+                if len(errors) < max_errors:
+                    errors.append({"type": "floating", "instance_id": iid,
+                                   "note": "No baseplate / brick beneath with >= 1 stud overlap."})
+
+    issue_count = collision_count + unknown_count + floating_count
     return {
-        "valid": collision_count == 0 and unknown_count == 0,
+        "valid": issue_count == 0,
         "errors": errors,
         "summary": {
             "parts": len(STATE.parts),
             "collisions": collision_count,
             "unknown_parts": unknown_count,
-            "errors_truncated": collision_count + unknown_count > len(errors),
+            "floating": floating_count,
+            "errors_truncated": issue_count > len(errors),
         },
     }
 
