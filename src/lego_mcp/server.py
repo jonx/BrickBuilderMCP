@@ -100,6 +100,12 @@ class ModelState:
     _next_id: int = 1
     current_subassembly: str = "main"
     notes: dict[str, str] = field(default_factory=dict)
+    # Builder mode: `built` is the set of instance_ids physically placed so
+    # far. In design mode (default), add_part auto-adds the new id to `built`
+    # so legacy behavior is preserved. After `start_builder_session()` the
+    # set is cleared and the LLM advances by calling mark_built(...).
+    built: set[str] = field(default_factory=set)
+    builder_mode: bool = False
     # Op-based undo/redo: O(1) per mutation regardless of model size.
     _undo: list[Op] = field(default_factory=list)
     _redo: list[Op] = field(default_factory=list)
@@ -136,8 +142,11 @@ def _record(op: Op) -> None:
 def _apply_forward(op: Op) -> None:
     if op.kind == "add":
         STATE.parts[op.instance_id] = deepcopy(op.data["inst"])
+        if not STATE.builder_mode:
+            STATE.built.add(op.instance_id)
     elif op.kind == "remove":
         STATE.parts.pop(op.instance_id, None)
+        STATE.built.discard(op.instance_id)
     elif op.kind == "move":
         inst = STATE.parts[op.instance_id]
         inst.x, inst.y, inst.z = op.data["new_pos"]
@@ -148,8 +157,11 @@ def _apply_forward(op: Op) -> None:
 def _apply_inverse(op: Op) -> None:
     if op.kind == "add":
         STATE.parts.pop(op.instance_id, None)
+        STATE.built.discard(op.instance_id)
     elif op.kind == "remove":
         STATE.parts[op.instance_id] = deepcopy(op.data["inst"])
+        if not STATE.builder_mode:
+            STATE.built.add(op.instance_id)
     elif op.kind == "move":
         inst = STATE.parts[op.instance_id]
         inst.x, inst.y, inst.z = op.data["old_pos"]
@@ -460,6 +472,8 @@ def _reset_state(name: str, keep_checkpoints: bool = False) -> None:
     STATE._next_id = 1
     STATE.current_subassembly = "main"
     STATE.notes.clear()
+    STATE.built.clear()
+    STATE.builder_mode = False
     STATE._undo.clear()
     STATE._redo.clear()
     if not keep_checkpoints:
@@ -526,6 +540,10 @@ def add_part(
     inst_id = STATE.new_id()
     candidate.instance_id = inst_id
     STATE.parts[inst_id] = candidate
+    # Design mode (default): every add is "placed". Builder mode: the new part
+    # is part of the target but not yet built — the LLM advances via mark_built.
+    if not STATE.builder_mode:
+        STATE.built.add(inst_id)
     _record(Op("add", inst_id, {"inst": deepcopy(candidate)}))
     return {"ok": True, "instance_id": inst_id, "part": _inst_dict(candidate)}
 
@@ -840,6 +858,162 @@ def find_subassembly_connections(movable: str,
         "candidates": candidates,
         "count": len(candidates),
     }
+
+
+@mcp.tool()
+def plan_build_sequence(subassembly: str | None = None,
+                        max_steps: int = 50,
+                        start_after: int = 0) -> dict[str, Any]:
+    """Return human-style instructions for building the current model.
+
+    The sequence is ordered so every returned step is either on the ground or
+    supported by parts from earlier steps. Use `start_after`/`max_steps` for
+    paged instructions on large models.
+    """
+    from lego_mcp.build_steps import plan_build_sequence as _plan
+    selected = _parts_for_subassembly(subassembly)
+    result = _plan(selected, PART_INDEX, part_aabb_world,
+                   max_steps=max_steps, start_after=start_after)
+    result["subassembly"] = subassembly
+    return result
+
+
+@mcp.tool()
+def next_build_step(subassembly: str | None = None,
+                    built_count: int = 0) -> dict[str, Any]:
+    """Return the next physically placeable part after `built_count` steps.
+
+    This is a small convenience wrapper over `plan_build_sequence`; a client
+    can keep advancing `built_count` to walk the model piece by piece.
+    """
+    if built_count < 0:
+        raise ValueError("built_count must be >= 0")
+    planned = plan_build_sequence(subassembly=subassembly,
+                                  max_steps=1,
+                                  start_after=built_count)
+    steps = planned.get("steps", [])
+    return {
+        "ok": planned["ok"] and bool(steps),
+        "subassembly": subassembly,
+        "built_count": built_count,
+        "total_parts": planned.get("total_parts", 0),
+        "next": steps[0] if steps else None,
+        "complete": planned["ok"] and built_count >= planned.get("total_parts", 0),
+        "blocked_count": planned.get("blocked_count", 0),
+        "blocked": planned.get("blocked", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Builder mode: partial → target workflow.
+# `STATE.built` is the set of instance_ids that have been physically placed.
+# In design mode (default), every add_part auto-adds to `built`. After
+# start_builder_session() the model becomes a TARGET and the LLM advances by
+# calling mark_built(...).
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def start_builder_session() -> dict[str, Any]:
+    """Treat the current model as a build TARGET. Clears the 'built' set so
+    every part becomes unbuilt; subsequent add_part calls won't auto-mark as
+    built either. Use this when you have a complete target model and want to
+    walk through placing it one part at a time."""
+    STATE.builder_mode = True
+    target_total = len(STATE.parts)
+    STATE.built.clear()
+    return {"ok": True, "builder_mode": True, "target_parts": target_total,
+            "built": 0}
+
+
+@mcp.tool()
+def end_builder_session(mark_all_built: bool = True) -> dict[str, Any]:
+    """Exit builder mode. By default marks all parts as built (so subsequent
+    operations see a complete model). Pass mark_all_built=False to leave the
+    built set as-is."""
+    STATE.builder_mode = False
+    if mark_all_built:
+        STATE.built = set(STATE.parts.keys())
+    return {"ok": True, "builder_mode": False, "built": len(STATE.built)}
+
+
+@mcp.tool()
+def mark_built(instance_id: str) -> dict[str, Any]:
+    """Mark one part as physically placed. Validates that the part is a real
+    target part (i.e. exists in STATE.parts)."""
+    if instance_id not in STATE.parts:
+        raise ValueError(f"No part with instance_id={instance_id!r}")
+    STATE.built.add(instance_id)
+    return {"ok": True, "instance_id": instance_id,
+            "built": len(STATE.built), "total": len(STATE.parts)}
+
+
+@mcp.tool()
+def mark_built_batch(instance_ids: list[str]) -> dict[str, Any]:
+    """Mark multiple parts as built in one call. Skips ids that don't exist
+    in the target model (returns them as `unknown`)."""
+    unknown: list[str] = []
+    placed = 0
+    for iid in instance_ids:
+        if iid not in STATE.parts:
+            unknown.append(iid)
+            continue
+        if iid not in STATE.built:
+            STATE.built.add(iid)
+            placed += 1
+    return {"ok": True, "newly_built": placed, "unknown": unknown,
+            "built": len(STATE.built), "total": len(STATE.parts)}
+
+
+@mcp.tool()
+def unmark_built(instance_id: str) -> dict[str, Any]:
+    """Reverse a mark_built — moves the part back to the unbuilt set."""
+    STATE.built.discard(instance_id)
+    return {"ok": True, "instance_id": instance_id, "built": len(STATE.built)}
+
+
+@mcp.tool()
+def reset_build_progress() -> dict[str, Any]:
+    """Clear the entire built set (start over)."""
+    STATE.built.clear()
+    return {"ok": True, "built": 0, "total": len(STATE.parts)}
+
+
+@mcp.tool()
+def builder_status() -> dict[str, Any]:
+    """One-shot snapshot of building progress.
+
+    Returns:
+        total: target part count
+        built: how many have been placed
+        remaining: target - built
+        next_up: the next placeable unbuilt part (or None if blocked/complete)
+        blocked_count: unbuilt parts that can't be placed yet (waiting on supporters)
+        complete: True if every target part is built
+    """
+    from lego_mcp.build_steps import next_unbuilt_step as _next
+    r = _next(STATE.parts, PART_INDEX, part_aabb_world, STATE.built, limit=1)
+    next_up = r["candidates"][0] if r["candidates"] else None
+    return {
+        "builder_mode": STATE.builder_mode,
+        "total": r["total_parts"],
+        "built": r["built_count"],
+        "remaining": r["remaining"],
+        "next_up": next_up,
+        "blocked_count": r["blocked_count"],
+        "complete": r["complete"],
+    }
+
+
+@mcp.tool()
+def next_unbuilt_step(limit: int = 1) -> dict[str, Any]:
+    """Return the next `limit` placeable unbuilt parts, considering only
+    currently-built parts as available supporters. Use this in a builder loop:
+    call this, place the brick (or call mark_built on the returned id), repeat.
+    """
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    from lego_mcp.build_steps import next_unbuilt_step as _next
+    return _next(STATE.parts, PART_INDEX, part_aabb_world, STATE.built, limit=limit)
 
 
 CELL_SIZE = 80.0  # LDU. Picked to roughly match a 2x4 brick footprint.
@@ -1220,6 +1394,32 @@ try:
         return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
                 "parts": len(STATE.parts), "width": width, "height": height,
                 "color_mode": color_mode, "hidden_edges": hidden_edges}
+
+    @mcp.tool()
+    def render_progress(width: int = 800, height: int = 600,
+                         color_mode: str = "model",
+                         hidden_edges: bool = True) -> dict[str, Any]:
+        """Render the build-in-progress: parts in STATE.built render normally,
+        unbuilt parts show as ghosts (washed-out, no studs). Use this in a
+        builder loop to see what's been placed vs what's still to come.
+
+        Writes to ./renders/<timestamp>_<model>_progress.png AND updates
+        ./renders/latest.png like render_model does.
+        """
+        from datetime import datetime
+        renders_dir = Path("renders").resolve()
+        renders_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
+        out = renders_dir / f"{stamp}_{safe_name}_progress.png"
+        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
+                               color_mode=color_mode, hidden_edges=hidden_edges,
+                               built_set=STATE.built)
+        out.write_bytes(png)
+        (renders_dir / "latest.png").write_bytes(png)
+        return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
+                "built": len(STATE.built), "total": len(STATE.parts),
+                "width": width, "height": height}
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
 

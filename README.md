@@ -77,6 +77,8 @@ You'll find PNG renders in `./renders/<timestamp>.png` (history preserved; `late
 | `move_subassembly(name, dx, dy, dz)` | Move a rigid tagged module, undoable per part |
 | `analyze_assembly_ports(subassembly)` | Cluster exposed studs/receivers into usable attachment ports for a whole module |
 | `find_subassembly_connections(movable, target)` | Suggest offsets that align exposed ports between modules |
+| `plan_build_sequence(subassembly, max_steps, start_after)` | Turn the current target model into human-style build steps where every step has support below. Page through large models with `start_after`. |
+| `next_build_step(subassembly, built_count)` | Return the next physically placeable piece after a built prefix. |
 
 ### High-level building helpers
 | Tool | What it does |
@@ -84,6 +86,8 @@ You'll find PNG renders in `./renders/<timestamp>.png` (history preserved; `late
 | `build_wall(x0, z0, x1, z1, height_rows, color, bond, brick_part, base_y, inset_ends)` | A straight wall with `stretcher` or `running` bond. Each running-bond row is offset by half a brick — real masonry. |
 | `build_perimeter(points, height_rows, color, base_y, thickness_studs, palette)` | Generic bonded rectilinear wall outline from outer-corner points. This is the footprint compiler for plans/images/models; `build_room` is a rectangle wrapper around it. |
 | `build_room(x_min, z_min, x_max, z_max, height_rows, color, base_y, palette)` | A 2-stud-thick rectangular perimeter with bonded corners. Courses alternate which wall direction owns each corner, so the next row bridges the seam below. Use `palette=["3001"]` to force 2x4-only walls when dimensions fit. |
+| `build_wall_with_openings(start_x, start_z, end_x, end_z, height_rows, openings, ...)` | Straight wall compiler with rectangular, round-arch, or lancet window spans. Openings can be transparent/colored fill or true voids. |
+| `build_stepped_gable_roof(...)` / `build_stepped_pyramid_roof(...)` | Connector-aware stepped roofs for naves and towers. Layers overlap so validation sees real support. |
 | `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` | Tile a rectangle with plates |
 | `repeat_pattern(part_id, count, dx, dy, dz, ...)` | Array of identical parts |
 
@@ -148,7 +152,7 @@ Architecture and decisions in [NOTES.md](NOTES.md).
 
 - **No physics simulation.** A connected structure that would topple is reported as valid.
 - **No stud-clutch geometry.** Connection is approximated by axis-aligned XZ overlap, not by per-stud mating. False negatives can happen with rotated parts or 1x1 corner contacts.
-- **General wall outlines are a first pass.** `build_perimeter(points=...)` handles closed orthogonal footprints. Openings, diagonal/curved walls, roofs, and organic surfaces still need richer volume compilation.
+- **The volume compiler is still rectilinear.** `build_perimeter(points=...)` handles closed orthogonal footprints, and straight walls can now have arched/lancet openings. Diagonal/curved walls, integrated openings across arbitrary polygons, and organic surfaces still need richer volume compilation.
 - **Generic helpers don't know about half-stud / jumper-plate offsets.** Vertical 8-LDU plate offsets work; horizontal half-stud needs manual placement.
 - **No photoreal renderer.** Built-in is isometric AABB-with-studs; for pretty renders, open the exported MPD in BrickLink Studio.
 

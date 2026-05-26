@@ -187,8 +187,14 @@ def render_model_png(
     margin: int = 40,
     color_mode: str = "model",
     hidden_edges: bool = True,
+    built_set: set[str] | None = None,
 ) -> bytes:
-    """Render the model and return PNG bytes."""
+    """Render the model and return PNG bytes.
+
+    If `built_set` is provided, parts NOT in the set are rendered as 'ghosts'
+    (washed-out, no studs) so you can see the target outline plus what's
+    actually been placed. Useful for builder-mode progress views.
+    """
     from lego_mcp.parts import color_rgb
     from lego_mcp.server import part_aabb_world
 
@@ -261,9 +267,17 @@ def render_model_png(
         part_records.append((ordinal, inst, part, aabb))
     all_aabbs = [aabb for _ordinal, _inst, _part, aabb in part_records]
 
+    def _ghost(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+        """Wash out an rgb toward the background for unbuilt parts."""
+        bg = background
+        return tuple(int(rgb[i] * 0.18 + bg[i] * 0.82) for i in range(3))  # type: ignore[return-value]
+
     for ordinal, inst, part, aabb in part_records:
         (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
         rgb = _debug_rgb(inst, ordinal, color_mode, color_rgb(inst.color))
+        is_ghost = built_set is not None and inst.instance_id not in built_set
+        if is_ghost:
+            rgb = _ghost(rgb)
         w, h, d = (xmax - xmin), (ymax - ymin), (zmax - zmin)
         top_covers = _face_is_fully_covered("top", aabb, all_aabbs)
         east_covers = _face_is_fully_covered("east", aabb, all_aabbs)
@@ -305,8 +319,9 @@ def render_model_png(
         # to the painter sort so stacked bricks correctly cover studs below.
         rot = resolve_rotation(inst.rotation)
         # Studs slightly brighter than the top face so they read as raised.
+        # Ghost parts skip studs entirely (the wash-out is the ghost cue).
         stud_fill = _shade(rgb, 1.25)
-        if not top_covers:
+        if not top_covers and not is_ghost:
             for sx_local, sy_local, sz_local in _stud_positions_local(part):
                 wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
                 world_center = (wx + inst.x, wy + inst.y, wz + inst.z)

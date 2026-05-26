@@ -59,8 +59,10 @@ None of these change Phase 1 *yet*, but I want the seams to exist:
 
 - **General outline bonding is a first pass.** `build_perimeter(points=...)`
   now handles closed orthogonal outlines by alternating corner ownership per
-  row. The next gap is openings and non-orthogonal / curved / sloped surfaces,
-  which need a richer volume compiler rather than more object-specific tools.
+  row, and straight walls can be compiled with rectangular/arched/lancet
+  openings. The next gap is integrating openings into arbitrary polygon edges
+  and supporting non-orthogonal / curved / sloped surfaces without
+  object-specific tools.
 - **`MIN_SUPPORT_AREA = 400 LDU²` is one full stud overlap.** Real LEGO
   studs are circular (~6 LDU radius); my check uses axis-aligned XZ
   rectangles. A part with 400 LDU² of rectangular overlap definitely has a

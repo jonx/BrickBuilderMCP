@@ -44,6 +44,8 @@ TECHNIQUES_BLURB = """\
 
 - **Running bond (stretcher)**: each brick row offset by half a brick from the row below — distributes load, looks like real masonry. Use `build_wall(..., bond="running")`.
 - **Bonded rectilinear perimeters**: use `build_perimeter(points=[...])` for footprints from images/plans/models. Use `build_room(...)` only as the rectangle shortcut. Corners alternate direction by row; use `palette=["3001"]` when you specifically want 2x4-only walls and the dimensions fit.
+- **Openings and arches**: use `build_wall_with_openings(...)` for straight walls with rectangular, round-arch, or lancet spans. Keep opening edges on the stud grid and leave at least two studs of pier between adjacent openings.
+- **Roofs**: use `build_stepped_gable_roof(...)` for nave/house roofs and `build_stepped_pyramid_roof(...)` for towers. The default parts are connector-aware, so validation can prove the roof is supported.
 - **English bond**: alternating header (short side facing out) and stretcher rows. Use for thick, sturdy walls.
 - **Plates instead of bricks**: 3 plates = 1 brick height. Use plates where you need fine height control or where the model will be picked up (plates lock).
 - **Tiles for smooth tops**: when a surface should look finished (floors, roofs, road).
@@ -52,6 +54,7 @@ TECHNIQUES_BLURB = """\
 - **MILS baseplate modules**: 64-stud (8x8) modular units for landscaping.
 - **Reference / mirror**: build one half, then `mirror_subassembly`. Cathedrals, castles, vehicles often have symmetry.
 - **Assembly ports**: after building a module, use `analyze_assembly_ports(subassembly)` to see exposed studs/receivers, and `find_subassembly_connections(movable, target)` before moving or cloning large modules.
+- **Human build order**: after a target model validates, use `plan_build_sequence(...)` for paged step-by-step instructions or `next_build_step(...)` to advance one placeable piece at a time.
 - **Color coding subassemblies**: use vivid colors during the build to keep mechanisms visually distinct, then re-color before final render.
 """
 
@@ -210,10 +213,15 @@ Here are well-known LEGO building techniques relevant to this toolchain. Apply t
 You also have these LegoMCP helpers (call them by name with no arguments to see signatures):
 - `build_wall(x0, z0, x1, z1, height, color, bond)`
 - `build_perimeter(points, height_rows, color, thickness_studs, palette)`
+- `build_wall_with_openings(start_x, start_z, end_x, end_z, height_rows, openings)`
+- `build_stepped_gable_roof(x_min, z_min, x_max, z_max, eave_y, ridge_axis)`
+- `build_stepped_pyramid_roof(x_min, z_min, x_max, z_max, eave_y)`
 - `build_floor(x_min, z_min, x_max, z_max, y, color, part)`
 - `build_room(x_min, z_min, x_max, z_max, height_rows, color)`
 - `clone_subassembly(src, dst, x_offset, y_offset, z_offset)`
 - `mirror_subassembly(src, dst, axis, plane_offset)`
 - `analyze_assembly_ports(subassembly)`
 - `find_subassembly_connections(movable, target)`
+- `plan_build_sequence(subassembly, max_steps, start_after)`
+- `next_build_step(subassembly, built_count)`
 """)]
