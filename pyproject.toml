@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# `agent` is for the standalone Claude-driven build script (lego_mcp/agent.py).
+# Not required to run the MCP server itself.
+agent = ["anthropic>=0.40.0"]
 
 [project.scripts]
 lego-mcp = "lego_mcp.__main__:main"
