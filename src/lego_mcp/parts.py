@@ -25,12 +25,18 @@ LDU_PER_BRICK = 24  # 3 plates
 
 @dataclass(frozen=True)
 class Part:
-    """A part definition. Size is in LDU. Origin is center-bottom."""
+    """A part definition. Size is in LDU. Origin is center-bottom.
+
+    `studs` is the list of (x, y, z) positions where this part has a TOP stud,
+    in part-local coordinates. Empty for tiles, smooth-top parts, or when stud
+    geometry couldn't be parsed.
+    """
     part_id: str
     name: str
     width: int       # +X extent, LDU
     depth: int       # +Z extent, LDU
     height: int      # height upward (toward -Y), LDU
+    studs: tuple[tuple[float, float, float], ...] = ()
 
 
 # LDraw convention: a "Brick A x B" has the LARGER dimension along +X (width)
@@ -188,31 +194,49 @@ def install_library(target: Path | None = None) -> Path:
     return dest
 
 
-def _parse_dat_header(path: Path) -> tuple[str, tuple[float, float, float, float, float, float]] | None:
-    """Read a .dat file's description and compute an AABB from its primitive vertices.
+_STUD_FILES = {"stud.dat", "stud2.dat", "stud3.dat", "stud4.dat"}
+# stud4a, studx, etc. are "open" / "anti-stud" variants used for bottom
+# connection points — we deliberately skip them when collecting TOP studs.
 
-    Returns (name, (minx, miny, minz, maxx, maxy, maxz)) or None if unparseable.
-    AABBs from primitives only (line types 2/3/4); subfile references (type 1) are ignored.
-    Good enough for built-in-style AABB collision in the common case.
+
+def _parse_dat(path: Path) -> tuple[str, list[tuple[str, str, tuple[float, ...]]], list[tuple[float, float, float]]] | None:
+    """Parse a .dat file.
+
+    Returns (name, type1_refs, prim_vertices) where:
+        type1_refs: list of (filename, head_token, full_floats) — head_token is
+            color, full_floats is (x,y,z, a,b,c, d,e,f, g,h,i) (12 floats).
+        prim_vertices: flat list of (x,y,z) tuples from primitives (types 2..5)
+            for AABB calculation.
     """
     try:
         text = path.read_text(encoding="latin-1", errors="ignore")
     except OSError:
         return None
     name = ""
-    minp = [float("inf")] * 3
-    maxp = [float("-inf")] * 3
-    has_any = False
+    type1_refs: list[tuple[str, str, tuple[float, ...]]] = []
+    prim_vertices: list[tuple[float, float, float]] = []
     for line in text.splitlines():
         s = line.strip()
         if not s:
             continue
         if not name and s.startswith("0 "):
             name = s[2:].strip()
+            continue
         head = s.split(maxsplit=1)[0]
-        if head in ("2", "3", "4", "5"):
+        if head == "1":
+            tokens = s.split()
+            if len(tokens) < 15:
+                continue
+            color_tok = tokens[1]
+            try:
+                values = tuple(float(t) for t in tokens[2:14])
+            except ValueError:
+                continue
+            # Filename is everything after the 14 fixed tokens; normalize separators.
+            fname = " ".join(tokens[14:]).strip().lower().replace("\\", "/")
+            type1_refs.append((fname, color_tok, values))
+        elif head in ("2", "3", "4", "5"):
             parts = s.split()
-            # Line types 2..5: type colour x1 y1 z1 x2 y2 z2 ...
             try:
                 coords = list(map(float, parts[2:]))
             except ValueError:
@@ -220,17 +244,103 @@ def _parse_dat_header(path: Path) -> tuple[str, tuple[float, float, float, float
             for i in range(0, len(coords), 3):
                 if i + 2 >= len(coords):
                     break
-                x, y, z = coords[i], coords[i + 1], coords[i + 2]
-                if x < minp[0]: minp[0] = x
-                if y < minp[1]: minp[1] = y
-                if z < minp[2]: minp[2] = z
-                if x > maxp[0]: maxp[0] = x
-                if y > maxp[1]: maxp[1] = y
-                if z > maxp[2]: maxp[2] = z
-                has_any = True
-    if not has_any:
+                prim_vertices.append((coords[i], coords[i + 1], coords[i + 2]))
+    return name, type1_refs, prim_vertices
+
+
+def _parse_dat_header(path: Path) -> tuple[str, tuple[float, float, float, float, float, float]] | None:
+    """Read a .dat file's description and compute an AABB from its primitive vertices."""
+    parsed = _parse_dat(path)
+    if not parsed:
         return None
-    return name, (minp[0], minp[1], minp[2], maxp[0], maxp[1], maxp[2])
+    name, _, prim_vertices = parsed
+    if not prim_vertices:
+        return None
+    xs = [v[0] for v in prim_vertices]
+    ys = [v[1] for v in prim_vertices]
+    zs = [v[2] for v in prim_vertices]
+    return name, (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+
+def _matmul(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, ...]:
+    """Compose two LDraw transforms: each is (x,y,z, a..i). Returns the same shape."""
+    ax, ay, az = a[0], a[1], a[2]
+    a_m = a[3:12]
+    bx, by, bz = b[0], b[1], b[2]
+    b_m = b[3:12]
+    # World position = a_pos + a_mat @ b_pos
+    nx = ax + a_m[0]*bx + a_m[1]*by + a_m[2]*bz
+    ny = ay + a_m[3]*bx + a_m[4]*by + a_m[5]*bz
+    nz = az + a_m[6]*bx + a_m[7]*by + a_m[8]*bz
+    # New matrix = a_mat @ b_mat
+    def row(i):
+        return (
+            a_m[i*3]*b_m[0] + a_m[i*3+1]*b_m[3] + a_m[i*3+2]*b_m[6],
+            a_m[i*3]*b_m[1] + a_m[i*3+1]*b_m[4] + a_m[i*3+2]*b_m[7],
+            a_m[i*3]*b_m[2] + a_m[i*3+1]*b_m[5] + a_m[i*3+2]*b_m[8],
+        )
+    nm = row(0) + row(1) + row(2)
+    return (nx, ny, nz) + nm
+
+
+def _extract_studs(part_id: str, ldraw_home: Path, max_depth: int = 3
+                   ) -> list[tuple[float, float, float]]:
+    """Recursively scan a part for TOP stud positions in part-local coords.
+
+    A stud reference is any type-1 line whose filename is in _STUD_FILES.
+    We keep only studs whose orientation matrix has its Y axis pointing in the
+    -Y direction (i.e. e[1][1] > 0 — the standard 'stud points up' matrix).
+    Anti-studs (bottom connectors, with e[1][1] < 0) are skipped.
+
+    Subfile refs into the s/ directory are recursed up to max_depth levels.
+    """
+    parts_dir = ldraw_home / "parts"
+    s_dir = parts_dir / "s"
+    visited: set[str] = set()
+    out: list[tuple[float, float, float]] = []
+
+    def walk(filename: str, transform: tuple[float, ...], depth: int) -> None:
+        if depth > max_depth or filename in visited:
+            return
+        visited.add(filename)
+        # Resolve file path: try parts/<name>, then parts/s/<basename>.
+        path = parts_dir / filename
+        if not path.is_file():
+            base = Path(filename).name
+            path = s_dir / base
+        if not path.is_file():
+            return
+        parsed = _parse_dat(path)
+        if not parsed:
+            return
+        _, refs, _ = parsed
+        for fname, _color, values in refs:
+            base = Path(fname).name
+            if base in _STUD_FILES:
+                # Compose with the current transform to get world-local stud position.
+                composed = _matmul(transform, values)
+                # composed[0..2] = position, composed[3..11] = matrix.
+                # The stud's local Y axis transformed = (composed[4], composed[7], ?? wait
+                # we want the y-direction of the stud's local frame in part-local coords.
+                # Stud's local +Y axis = matrix column 1 = (matrix[1], matrix[4], matrix[7]).
+                # But "stud points up" means its local +Y maps to -Y in part frame.
+                # The standard stud has its cylinder along +Y in its local frame, with
+                # the tube emerging from y=0 toward y=-4 (so y_local component matters).
+                # We use e[1][1] (composed[7]) as the proxy: if > 0, the stud's local +Y
+                # has a positive +Y component in part frame -> points DOWN -> top stud.
+                # If <= 0, it points UP in part frame -> bottom anti-stud, skip.
+                e11 = composed[7]
+                if e11 > 0:
+                    out.append((composed[0], composed[1], composed[2]))
+            elif depth < max_depth and ("/" in fname or fname.startswith("s\\") or
+                                         (s_dir / Path(fname).name).is_file()):
+                # Recurse into subpart with composed transform.
+                composed = _matmul(transform, values)
+                walk(fname, composed, depth + 1)
+
+    identity = (0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
+    walk(f"{part_id}.dat", identity, 0)
+    return out
 
 
 def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
@@ -253,8 +363,11 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
             try:
                 data = json.loads(CACHE_FILE.read_text())
                 return {
-                    pid: Part(part_id=pid, name=p["name"], width=p["width"],
-                              depth=p["depth"], height=p["height"])
+                    pid: Part(
+                        part_id=pid, name=p["name"],
+                        width=p["width"], depth=p["depth"], height=p["height"],
+                        studs=tuple(tuple(s) for s in p.get("studs", [])),
+                    )
                     for pid, p in data.items()
                 }
             except (OSError, ValueError, KeyError):
@@ -267,22 +380,29 @@ def load_library_index(ldraw_home: Path | None = None) -> dict[str, Part]:
             continue
         name, (minx, miny, minz, maxx, maxy, maxz) = result
         part_id = dat.stem
-        # Convert AABB extents to width/depth/height (rounded to nearest LDU).
-        # -Y is up so "height" is the upward extent (away from -Y).
+        # Extract real top-stud positions by recursively parsing the part.
+        # Skip on parse failure (no studs is also fine for tiles/baseplates).
+        try:
+            studs = tuple(_extract_studs(part_id, home))
+        except Exception:  # noqa: BLE001
+            studs = ()
         index[part_id] = Part(
             part_id=part_id,
             name=name,
             width=max(1, int(round(maxx - minx))),
             depth=max(1, int(round(maxz - minz))),
             height=max(1, int(round(maxy - miny))),
+            studs=studs,
         )
-    # Always include the built-in entries — they're vetted.
+    # The LDraw-parsed entries are authoritative; only fall back to built-ins
+    # for parts that aren't in the library.
     for pid, p in BUILTIN_PARTS.items():
         index.setdefault(pid, p)
 
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CACHE_FILE.write_text(json.dumps(
-        {pid: {"name": p.name, "width": p.width, "depth": p.depth, "height": p.height}
+        {pid: {"name": p.name, "width": p.width, "depth": p.depth, "height": p.height,
+               "studs": [list(s) for s in p.studs]}
          for pid, p in index.items()},
     ))
     return index

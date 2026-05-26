@@ -154,11 +154,11 @@ def _apply_inverse(op: Op) -> None:
 
 
 def _require_part(part_id: str) -> Part:
+    # Load the full library on first lookup (idempotent + cache-backed).
+    # Without this, built-in parts would short-circuit and we'd never get the
+    # real LDraw stud positions / catalog metadata.
+    _ensure_library_loaded()
     p = PART_INDEX.get(part_id) or PART_INDEX.get(part_id.lower())
-    if p is None:
-        # First miss: load the full library and retry, in case the user installed it.
-        _ensure_library_loaded()
-        p = PART_INDEX.get(part_id) or PART_INDEX.get(part_id.lower())
     if not p:
         raise ValueError(
             f"Unknown part {part_id!r}. Use search_parts() to find one, or run "

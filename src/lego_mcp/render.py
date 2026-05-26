@@ -43,28 +43,49 @@ def _shade(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
 
 
 def _stud_positions_local(part) -> list[tuple[float, float, float]]:
-    """Stud center positions on the part's top face, in part-local coords.
+    """Top-stud center positions, in part-local coords.
 
-    Conservative: no studs on parts whose name contains 'tile' or 'baseplate'
-    (those have smooth tops / too-many-for-this-renderer), and on any part with
-    more than MAX_STUDS_PER_PART studs.
-    Top face is at local y = -part.height (since -Y is up in LDraw).
+    Prefers the real positions parsed from the LDraw .dat file. Falls back to
+    a grid-based heuristic for built-in-only parts (when the library isn't
+    installed). Skips on parts whose name contains 'tile' (smooth top) or that
+    would have more than MAX_STUDS_PER_PART studs.
     """
     name_lower = part.name.lower()
     if "tile" in name_lower:
         return []
+
+    # Real stud positions from LDraw geometry (after install-library).
+    if part.studs:
+        if len(part.studs) > MAX_STUDS_PER_PART:
+            return []
+        # LDraw convention: bricks extend from y=0 (origin/top) to y=+height (bottom).
+        # Our internal convention: origin is at the center of the bottom face,
+        # so the top of the brick is at local y = -part.height. The LDraw stud
+        # positions have y near 0 (the part's TOP in LDraw frame); we flip the
+        # sign and shift so they sit on our top face.
+        out = []
+        for sx, sy, sz in part.studs:
+            # Map LDraw local y (where y=0 is top) to our local y (where -height is top).
+            out.append((sx, -part.height + sy, sz))
+        return out
+
+    # Heuristic fallback for built-ins. Slopes: only one row of studs.
     nx = max(1, int(round(part.width / 20)))
     nz = max(1, int(round(part.depth / 20)))
     if nx * nz > MAX_STUDS_PER_PART:
         return []
     top_y = -part.height
-    studs = []
+    if "slope" in name_lower:
+        # Approximation: studs on a single back row centered along +Z.
+        sz = part.depth / 2 - 10
+        return [(-part.width / 2 + 10 + i * 20, top_y, sz) for i in range(nx)]
+    out = []
     for i in range(nx):
         for j in range(nz):
             sx = -part.width / 2 + 10 + i * 20
             sz = -part.depth / 2 + 10 + j * 20
-            studs.append((sx, top_y, sz))
-    return studs
+            out.append((sx, top_y, sz))
+    return out
 
 
 def _stud_disc_corners(cx: float, cy: float, cz: float) -> list[tuple[float, float, float]]:
@@ -106,7 +127,7 @@ def render_model_png(
     # painter sort has finer granularity. Inexpensive for normal models; cathedral
     # scale will want a real z-buffer or BSP. (See NOTES.md.)
     # Camera at (+X, -Y, +Z) -> "closeness" = X - Y + Z. Bigger = closer.
-    SUBDIV = 40.0  # LDU; matches a 2x2 brick footprint.
+    SUBDIV = 20.0  # LDU; one stud per chunk so studs sort correctly within their own brick.
     Face = tuple[float, list[tuple[float, float]], tuple[int, int, int], tuple[int, int, int] | None]
     faces: list[Face] = []
     all_proj: list[tuple[float, float]] = []
