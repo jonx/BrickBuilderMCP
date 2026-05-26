@@ -1633,6 +1633,44 @@ try:
         return [summary, img]
 
     @mcp.tool()
+    def render_inline(width: int = 600, height: int = 400) -> list:
+        """EXPERIMENT: render + return markdown image-data-URI + file path in
+        the text portion of the tool response, in addition to the usual
+        MCPImage content block.
+
+        Hypothesis: if the chat client renders markdown inside tool-result
+        text blocks, the inline `![](data:image/png;base64,...)` will show
+        up in-conversation. If it doesn't show up the rendered MCPImage block
+        still works (that's the existing render_model behavior).
+
+        Use this once to confirm what the client supports, then we either
+        promote the markdown to render_model or fall back to file links.
+        """
+        import base64
+        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height)
+        summary, img = _render_to_disk_and_image(png, name_suffix="_inline")
+        b64 = base64.b64encode(png).decode("ascii")
+        data_uri = f"data:image/png;base64,{b64}"
+        file_uri = f"file://{summary['path']}"
+        markdown = (
+            f"![render]({data_uri})\n\n"
+            f"Saved to: `{summary['path']}`\n"
+            f"File link: [{summary['path'].split('/')[-1]}]({file_uri})"
+        )
+        summary["bytes"] = len(png)
+        summary["data_uri_bytes"] = len(data_uri)
+        summary["note"] = (
+            "If you see the rendered image just above this text, the chat "
+            "client honors markdown image URIs in tool results — we can "
+            "promote this to render_model. If you only see this text + "
+            "the inline image block (the third content), markdown URIs "
+            "aren't rendered; stick with the standard MCPImage path."
+        )
+        # Order matters: text first so the markdown is visible BEFORE the
+        # JSON summary; ImageContent stays last as a fallback.
+        return [markdown, summary, img]
+
+    @mcp.tool()
     def view_latest_render() -> list:
         """Return the most recent render as an inline image. Useful if you've
         navigated away from a render call or want to see the current state
