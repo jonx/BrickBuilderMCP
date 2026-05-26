@@ -131,11 +131,13 @@ def render_model_png(
         sx, sy = _project(x, y, z)
         return sx * scale + off_x, sy * scale + off_y
 
-    # Pass 1: draw all sub-faces farthest-first (no outlines — they'd litter the image).
+    # Pass 1: draw all sub-faces farthest-first.
+    # Outline each sub-face in its own fill color so Pillow's rasterizer doesn't
+    # leave 1-pixel seams between adjacent subdivisions.
     faces.sort(key=lambda f: f[0])
     for _, screen, fill, _outline in faces:
         poly = [(sx * scale + off_x, sy * scale + off_y) for sx, sy in screen]
-        draw.polygon(poly, fill=fill)
+        draw.polygon(poly, fill=fill, outline=fill)
 
     # Pass 2: outline each part's silhouette on top, so edges read clearly.
     # We outline the 9 visible edges of each part's AABB. Outlines drawn on top

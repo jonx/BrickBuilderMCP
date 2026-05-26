@@ -1,8 +1,12 @@
 # LegoMCP
 
-An MCP server that lets an LLM design real LEGO models — by emitting validated LDraw files, not by clicking around in a CAD app.
+An [MCP](https://modelcontextprotocol.io) server that lets an LLM design real LEGO models — by emitting validated LDraw files, not by clicking around in a CAD app.
 
-Drop it into Claude Desktop (or any MCP client), say "build me a small castle", and the LLM gets a set of semantic tools: `add_part`, `move_part`, `validate_model`, `export_mpd`, undo/redo, checkpoints. The model state lives in the server. The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page), [LeoCAD](https://www.leocad.org/), or any LDraw viewer.
+Drop it into Claude Desktop (or any MCP client), say *"build me a small castle"*, and the LLM gets a set of semantic tools: `add_part`, `move_part`, `validate_model`, `render_model`, `export_mpd`, undo/redo, checkpoints. The model state lives in the server. The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page), [LeoCAD](https://www.leocad.org/), or any LDraw viewer.
+
+The built-in isometric renderer also writes a PNG to `./renders/<timestamp>_<model>.png` after every `render_model` call, so the LLM can see what it built and the history of the model is preserved.
+
+> Status: alpha. Works end-to-end with Claude Desktop. The built-in catalog has 36 common parts; run `lego-mcp install-library` to add the full ~20k LDraw catalog.
 
 ## Why this exists
 
@@ -14,17 +18,19 @@ The CAD app becomes the viewer. The MCP server is the source of truth.
 
 ```bash
 # 1. Install uv if you don't have it
-brew install uv     # macOS
+brew install uv                # macOS
 # or: curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 2. Install LegoMCP as a uv tool
+# 2. Clone and install LegoMCP
+git clone <this repo> LegoMCP && cd LegoMCP
 uv tool install --from . lego-mcp
 
-# 3. Download the LDraw parts library (~85 MB, one-time)
+# 3. (Optional) Download the full LDraw parts library (~85 MB).
+#    Skip this for now — you get 36 built-in parts and can come back later.
 lego-mcp install-library
 
-# 4. Point Claude Desktop at it
-#    Add to ~/Library/Application Support/Claude/claude_desktop_config.json:
+# 4. Point Claude Desktop at the server.
+#    Edit ~/Library/Application Support/Claude/claude_desktop_config.json:
 {
   "mcpServers": {
     "lego": {
@@ -34,41 +40,99 @@ lego-mcp install-library
 }
 ```
 
-Restart Claude Desktop. Ask Claude: *"List the parts in your current LEGO model."* If you get an empty list back, you're wired up.
+Restart Claude Desktop. Ask Claude:
+
+> *List the parts in your current LEGO model, then build me a small red house on a tan baseplate.*
+
+Then ask:
+
+> *Render the model.*
+
+You'll find the PNG in `./renders/latest.png`.
 
 ## What the LLM can do
 
 | Tool | What it does |
 |---|---|
 | `create_model(name)` | Start a fresh model |
-| `add_part(part_id, color, x, y, z, rotation)` | Place a brick. Rotation is one of `identity`, `rot90y`, `rot180y`, `rot270y`, `rot90x`, `rot90z` |
-| `remove_part(instance_id)` | Remove by stable instance ID |
+| `add_part(part_id, color, x, y, z, rotation)` | Place a brick. Returns the new `instance_id`. |
+| `remove_part(instance_id)` | Remove by ID |
 | `move_part(instance_id, x, y, z)` | Reposition |
-| `list_parts()` | Inspect current model |
-| `search_parts(query)` | Find part IDs by name |
-| `get_part_info(part_id)` | Dimensions, AABB, description |
-| `validate_model()` | Collision + reference checks |
+| `rotate_part(instance_id, rotation)` | Change orientation |
+| `list_parts()` | Inspect the current model |
+| `search_parts(query)` | Find part IDs by name ("brick 2x4") |
+| `get_part_info(part_id)` | Dimensions, name |
+| `list_colors()` | Supported color names and IDs |
+| `validate_model()` | AABB collision + unknown-part check |
 | `export_ldr(path)` / `export_mpd(path)` | Write to disk |
-| `import_ldr(path)` | Load an existing model |
-| `undo()` / `redo()` | |
-| `save_checkpoint(name)` / `restore_checkpoint(name)` | Named in-memory snapshots |
+| `import_ldr(path)` | Load an existing `.ldr` or `.mpd` |
+| `render_model(width, height)` | Built-in isometric PNG to `./renders/<timestamp>.png` |
+| `undo()` / `redo()` | Snapshot-based, ~200 steps |
+| `save_checkpoint(name)` / `restore_checkpoint(name)` / `list_checkpoints()` | Named in-memory snapshots |
 
-## Coordinate system
+### Rotations
 
-LDraw convention:
+Six canonical orientations (LEGO almost always wants 90° increments):
 
-- **1 brick** = 20 LDU wide × 24 LDU tall
-- **-Y is up** (right-handed)
-- **+X right, +Z forward**
+| Name | Effect |
+|---|---|
+| `identity` | No rotation |
+| `rot90y`, `rot180y`, `rot270y` | Rotate around the Y axis (vertical) |
+| `rot90x` | Rotate around X (tips a brick onto its side) |
+| `rot90z` | Rotate around Z |
 
-So a 2×4 brick sitting on the studs of another 2×4 brick is at `y = -24` (negative because up is `-Y`).
+### Coordinate convention (LDraw)
 
-## What this is not
+- Right-handed, **-Y is up.**
+- 1 stud = **20 LDU** wide.
+- 1 plate = **8 LDU** tall.
+- 1 brick = **24 LDU** tall (= 3 plates).
+- Part origins are at the **center of the bottom face**.
 
-- It does not check stud-clutch connectivity (yet — would need real LDraw connection-point parsing).
-- It does not estimate stability (no physics).
-- It does not render images (Phase 2 — will shell to LDView).
-- It does not automate BrickLink Studio. Open the exported `.mpd` manually.
+So a 2×4 brick at `y=0` sits on the ground; stack another on top at `y=-24`.
+
+## Example
+
+```python
+# (or have Claude do the same via tool calls)
+from lego_mcp.server import create_model, add_part, render_model
+
+create_model("tiny_house")
+add_part("3811", "tan", 0, 0, 0)                                  # 32x32 baseplate
+for x in range(-2, 3):
+    for z in range(-2, 3):
+        add_part("3022", "dark_tan", x*40, -4, z*40)               # floor
+
+for y in [-12, -36, -60]:                                          # 3 plate-rows of walls
+    for i in range(-2, 3):
+        add_part("3001", "red", i*40, y, -100)
+        add_part("3001", "red", i*40, y,  100)
+    for i in range(-1, 2):
+        add_part("3001", "red", -100, y, i*40, rotation="rot90y")
+        add_part("3001", "red",  100, y, i*40, rotation="rot90y")
+
+render_model()
+```
+
+See [examples/tiny_house.mpd](examples/tiny_house.mpd) for the exported model — open it in BrickLink Studio or LeoCAD.
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest         # full suite, includes a real MCP stdio handshake test
+```
+
+Architecture and decisions live in [NOTES.md](NOTES.md).
+
+## What this is not (yet)
+
+- **No stud-clutch validation.** AABB collision catches gross overlaps; doesn't verify that bricks actually snap together.
+- **No stability estimation.** A floating tower will pass validation.
+- **No subassembly authoring tools.** You can import multi-block MPDs (they get flattened); we author single-block files for now.
+- **Built-in renderer is AABB-only.** For photoreal renders, open the exported `.mpd` in BrickLink Studio.
+
+The [Strasbourg Cathedral astronomical clock](https://en.wikipedia.org/wiki/Strasbourg_astronomical_clock) is the north star — see NOTES.md for what gets added on the way there.
 
 ## License
 
