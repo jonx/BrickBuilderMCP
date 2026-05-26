@@ -28,6 +28,7 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
                bond: str = "running",
                brick_part: str = "3001",
                base_y: float = 0,
+               inset_ends: float = 0,
                ) -> dict[str, Any]:
     """Lay a straight wall from (x0,z0) to (x1,z1).
 
@@ -37,8 +38,14 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
         bond: "stretcher" (all bricks aligned) or "running" (each row offset
             by half a brick — looks like real masonry, more structurally sound).
         brick_part: defaults to 2x4 brick (3001). Use 3010 (1x4) for thin walls.
-        base_y: the y at which the BOTTOM row of bricks sits (so brick 0 has
-            top face at base_y - 24 in our convention).
+        base_y: Y of the top of the supporting surface (where row 0 sits).
+            For a brick standing on the ground plane, use 0 (default). For a
+            brick sitting on a 1-LDU-thick baseplate at y=0, use -1.
+        inset_ends: shorten the wall at each end by this many LDU so that two
+            perpendicular walls meeting at a corner don't overlap. For 4 walls
+            around a square room with 2x4 bricks (40 LDU thick), set
+            inset_ends=20 (half the wall thickness) on the wall pairs that
+            meet at corners.
 
     The wall runs in the dominant axis direction (X or Z) and is 1 brick
     thick perpendicular to that. Returns the count of bricks laid.
@@ -51,37 +58,42 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
 
     dx, dz = x1 - x0, z1 - z0
     along_x = abs(dx) >= abs(dz)
-    length = (dx * dx + dz * dz) ** 0.5
+    length = (dx * dx + dz * dz) ** 0.5 - 2 * inset_ends
     if length < short_dim:
-        return {"ok": False, "reason": "wall too short to fit one brick"}
+        return {"ok": False, "reason": "wall too short to fit one brick after inset"}
 
-    # Number of full bricks per row at offset=0
     n_full = int(length // long_dim)
-    # For running bond we accept an extra half-brick at one end on alternate rows
     rows: list[int] = []
     laid_ids: list[str] = []
-
-    # Direction along the wall (unit vector). Bricks lie centered on this line.
-    # For running bond, alternate rows shift by half a brick along the line.
     BRICK_H = 24
 
+    # For a 2x4 brick at identity, long axis is +X. Use identity for X-running
+    # walls; rotate to rot90y so the long axis aligns with Z for Z-running walls.
+    if along_x:
+        sign = 1 if dx >= 0 else -1
+        start_x = x0 + sign * inset_ends
+        rotation = "identity"
+    else:
+        sign = 1 if dz >= 0 else -1
+        start_z = z0 + sign * inset_ends
+        rotation = "rot90y"
+
     for row in range(height_rows):
-        y = base_y - 4 - row * BRICK_H  # -4 keeps the wall above a baseplate's top
-        offset_along = (long_dim / 2) if (bond == "running" and row % 2 == 1) else 0.0
-        # Bricks along the wall direction
-        n_this_row = n_full - (1 if (offset_along > 0 and (length - offset_along) // long_dim < n_full) else 0)
+        y = base_y - row * BRICK_H
+        offset_along = half if (bond == "running" and row % 2 == 1) else 0.0
+        n_this_row = n_full
+        # Running-bond offset rows fit one fewer full brick if it'd overshoot.
+        if offset_along > 0 and (n_full * long_dim + offset_along) > length:
+            n_this_row = max(0, n_full - 1)
         if along_x:
-            sign = 1 if dx >= 0 else -1
             for i in range(n_this_row):
-                cx = x0 + sign * (half + offset_along + i * long_dim)
-                # Wall thickness along Z, oriented to span short_dim
-                r = s.add_part(brick_part, color, cx, y, z0, rotation="rot90y")
+                cx = start_x + sign * (half + offset_along + i * long_dim)
+                r = s.add_part(brick_part, color, cx, y, z0, rotation=rotation)
                 laid_ids.append(r["instance_id"])
         else:
-            sign = 1 if dz >= 0 else -1
             for i in range(n_this_row):
-                cz = z0 + sign * (half + offset_along + i * long_dim)
-                r = s.add_part(brick_part, color, x0, y, cz)
+                cz = start_z + sign * (half + offset_along + i * long_dim)
+                r = s.add_part(brick_part, color, x0, y, cz, rotation=rotation)
                 laid_ids.append(r["instance_id"])
         rows.append(n_this_row)
 

@@ -219,15 +219,32 @@ MIN_SUPPORT_AREA = 400.0
 
 
 def _check_supported(inst_aabb: tuple, neighbor_aabbs: list[tuple]) -> bool:
-    """True if `inst_aabb` is grounded or sits on at least one neighbor's top face."""
-    _, (_, inst_bottom_y, _) = inst_aabb  # bottom face Y == aabb.max y (since -Y is up)
+    """True if the part has any valid LEGO connection.
+
+    A connection counts as valid if there's at least one stud's worth of
+    XZ overlap (>= MIN_SUPPORT_AREA) at the part's TOP face (held from above)
+    OR its BOTTOM face (sits on something below). Or the part is grounded.
+
+    Note: this is a local connectivity check, not a global reachability one.
+    A small connected island floating in space won't trip the floating-part
+    detector because each of its parts is locally "connected" to its neighbors.
+    A full reachability check (does this connected component touch the ground?)
+    is a future improvement — for now, the LLM can spot disconnected islands
+    by render + spatial reasoning.
+    """
+    (_, inst_top_y, _), (_, inst_bottom_y, _) = inst_aabb
     if abs(inst_bottom_y - GROUND_Y) < SUPPORT_TOL:
         return True
     for n in neighbor_aabbs:
-        (_, n_top_y, _), _ = n  # neighbor's top face Y == aabb.min y
-        if abs(n_top_y - inst_bottom_y) > SUPPORT_TOL:
-            continue
-        if xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA:
+        (_, n_top_y, _), (_, n_bottom_y, _) = n
+        # Connection from below: neighbor's top face matches our bottom face.
+        if (abs(n_top_y - inst_bottom_y) < SUPPORT_TOL
+                and xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA):
+            return True
+        # Connection from above (SNOT / hanging brick): neighbor's bottom face
+        # matches our top face.
+        if (abs(n_bottom_y - inst_top_y) < SUPPORT_TOL
+                and xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA):
             return True
     return False
 
@@ -801,30 +818,69 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
                                        "note": "AABB-based; corner-touching tiles may falsely overlap."})
 
     floating_count = 0
+    unanchored_count = 0
     if check_support:
+        # Build a connectivity graph: for each part, list other parts it has a
+        # valid LEGO connection to (top-bottom face match with >= 1 stud overlap).
+        neighbors: dict[str, set[str]] = {iid: set() for iid in aabbs}
+        grounded: set[str] = set()
         for iid, ab in aabbs.items():
-            # Candidate supporters: parts in the same XZ cells, at the right Y.
-            # We use the same grid to find vertical neighbors quickly.
-            cand_ids = set()
+            if abs(ab[1][1] - GROUND_Y) < SUPPORT_TOL:
+                grounded.add(iid)
+            # Candidate connection partners: parts in nearby cells.
+            cand_ids: set[str] = set()
             for key in _cell_keys(ab):
                 for other in grid.get(key, []):
                     if other != iid:
                         cand_ids.add(other)
-            neighbor_aabbs = [aabbs[c] for c in cand_ids if c in aabbs]
-            # Also check cells DIRECTLY below (one cell down in Y).
-            (_, ymin, _), (_, ymax, _) = ab
-            for key in _cell_keys(((ab[0][0], ymax, ab[0][2]),
-                                    (ab[1][0], ymax + CELL_SIZE, ab[1][2]))):
+            # Also one cell above and below.
+            (xmin, ymin, zmin), (xmax, ymax, zmax) = ab
+            extended = ((xmin, ymin - CELL_SIZE, zmin), (xmax, ymax + CELL_SIZE, zmax))
+            for key in _cell_keys(extended):
                 for other in grid.get(key, []):
                     if other != iid:
-                        neighbor_aabbs.append(aabbs[other])
-            if not _check_supported(ab, neighbor_aabbs):
+                        cand_ids.add(other)
+            for other in cand_ids:
+                other_ab = aabbs[other]
+                # Connected if top-bottom face match either direction with
+                # sufficient XZ overlap.
+                connected = False
+                if (abs(ab[1][1] - other_ab[0][1]) < SUPPORT_TOL
+                        and xz_overlap_area(ab, other_ab) >= MIN_SUPPORT_AREA):
+                    connected = True
+                if (abs(other_ab[1][1] - ab[0][1]) < SUPPORT_TOL
+                        and xz_overlap_area(ab, other_ab) >= MIN_SUPPORT_AREA):
+                    connected = True
+                if connected:
+                    neighbors[iid].add(other)
+
+        # Per-part "floating" = no local connection and not grounded.
+        for iid in aabbs:
+            if iid not in grounded and not neighbors[iid]:
                 floating_count += 1
                 if len(errors) < max_errors:
                     errors.append({"type": "floating", "instance_id": iid,
-                                   "note": "No baseplate / brick beneath with >= 1 stud overlap."})
+                                   "note": "No connection on top or bottom face."})
 
-    issue_count = collision_count + unknown_count + floating_count
+        # BFS from grounded parts. Anything unreachable is an unanchored island.
+        reachable = set(grounded)
+        queue = list(grounded)
+        while queue:
+            iid = queue.pop()
+            for n in neighbors[iid]:
+                if n not in reachable:
+                    reachable.add(n)
+                    queue.append(n)
+        for iid in aabbs:
+            if iid not in reachable and iid not in grounded:
+                # Don't double-count single floating bricks already counted above.
+                if neighbors[iid]:  # has neighbors but the island doesn't reach ground
+                    unanchored_count += 1
+                    if len(errors) < max_errors:
+                        errors.append({"type": "unanchored", "instance_id": iid,
+                                       "note": "Connected to neighbors but the island doesn't reach the ground."})
+
+    issue_count = collision_count + unknown_count + floating_count + unanchored_count
     return {
         "valid": issue_count == 0,
         "errors": errors,
@@ -833,6 +889,7 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
             "collisions": collision_count,
             "unknown_parts": unknown_count,
             "floating": floating_count,
+            "unanchored": unanchored_count,
             "errors_truncated": issue_count > len(errors),
         },
     }
