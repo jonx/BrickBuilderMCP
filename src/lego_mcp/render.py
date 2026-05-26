@@ -22,6 +22,11 @@ if TYPE_CHECKING:
 COS30 = math.cos(math.radians(30))
 SIN30 = math.sin(math.radians(30))
 
+STUD_RADIUS = 6.0      # LDU (real LEGO stud is 6 LDU radius)
+STUD_HEIGHT = 4.0      # LDU
+STUD_CIRCLE_SIDES = 12
+MAX_STUDS_PER_PART = 256  # skip on baseplate-size parts to keep render fast
+
 
 def _project(x: float, y: float, z: float) -> tuple[float, float]:
     """Isometric projection. LDraw convention: -Y is up.
@@ -35,6 +40,42 @@ def _project(x: float, y: float, z: float) -> tuple[float, float]:
 
 def _shade(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return tuple(max(0, min(255, int(c * factor))) for c in rgb)  # type: ignore[return-value]
+
+
+def _stud_positions_local(part) -> list[tuple[float, float, float]]:
+    """Stud center positions on the part's top face, in part-local coords.
+
+    Conservative: no studs on parts whose name contains 'tile' or 'baseplate'
+    (those have smooth tops / too-many-for-this-renderer), and on any part with
+    more than MAX_STUDS_PER_PART studs.
+    Top face is at local y = -part.height (since -Y is up in LDraw).
+    """
+    name_lower = part.name.lower()
+    if "tile" in name_lower:
+        return []
+    nx = max(1, int(round(part.width / 20)))
+    nz = max(1, int(round(part.depth / 20)))
+    if nx * nz > MAX_STUDS_PER_PART:
+        return []
+    top_y = -part.height
+    studs = []
+    for i in range(nx):
+        for j in range(nz):
+            sx = -part.width / 2 + 10 + i * 20
+            sz = -part.depth / 2 + 10 + j * 20
+            studs.append((sx, top_y, sz))
+    return studs
+
+
+def _stud_disc_corners(cx: float, cy: float, cz: float) -> list[tuple[float, float, float]]:
+    """A flat circle (polygon) at the TOP of a stud cylinder, in world coords."""
+    top_y = cy - STUD_HEIGHT  # studs rise toward -Y
+    return [
+        (cx + STUD_RADIUS * math.cos(2 * math.pi * i / STUD_CIRCLE_SIDES),
+         top_y,
+         cz + STUD_RADIUS * math.sin(2 * math.pi * i / STUD_CIRCLE_SIDES))
+        for i in range(STUD_CIRCLE_SIDES)
+    ]
 
 
 def render_model_png(
@@ -93,6 +134,8 @@ def render_model_png(
                 ]
                 _emit_face(corners, fill)
 
+    from lego_mcp.server import matrix_apply, resolve_rotation
+
     for inst in parts.values():
         part = index.get(inst.part_id)
         if part is None:
@@ -103,15 +146,24 @@ def render_model_png(
 
         # Subdivide each visible face into ~2-stud chunks so painter's depth
         # sorting resolves stacking correctly.
-        # Top face (y=ymin): vary in X and Z.
         _split_rect(p0=(xmin, ymin, zmin), du=(w, 0, 0), dv=(0, 0, d),
-                    length_u=w, length_v=d, fill=_shade(rgb, 1.10))
-        # Right face (x=xmax): vary in Y and Z.
+                    length_u=w, length_v=d, fill=_shade(rgb, 1.10))   # top
         _split_rect(p0=(xmax, ymin, zmin), du=(0, h, 0), dv=(0, 0, d),
-                    length_u=h, length_v=d, fill=_shade(rgb, 0.85))
-        # Front face (z=zmax): vary in X and Y.
+                    length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # right
         _split_rect(p0=(xmin, ymin, zmax), du=(w, 0, 0), dv=(0, h, 0),
-                    length_u=w, length_v=h, fill=_shade(rgb, 0.70))
+                    length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # front
+
+        # Studs on top, if applicable. Each stud is a small disc at the top of
+        # a 4-LDU-tall cylinder. We project the disc as a polygon and feed it
+        # to the painter sort so stacked bricks correctly cover studs below.
+        rot = resolve_rotation(inst.rotation)
+        # Studs slightly brighter than the top face so they read as raised.
+        stud_fill = _shade(rgb, 1.25)
+        for sx_local, sy_local, sz_local in _stud_positions_local(part):
+            wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
+            world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
+            disc = _stud_disc_corners(*world_center)
+            _emit_face(disc, stud_fill)
 
     if not all_proj:
         buf = io.BytesIO()
