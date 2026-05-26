@@ -273,10 +273,72 @@ def render_model_png(
                 ]
                 _emit_face(corners, fill)
 
-    from lego_mcp.server import matrix_apply, resolve_rotation
+    from lego_mcp.server import matrix_apply, resolve_rotation, effective_matrix
 
     OUTLINE_RGB = (40, 40, 40)
     HIDDEN_RGB = (80, 80, 80)
+
+    # For the oriented-box path used by parts with non-canonical matrices.
+    # Camera direction in iso view (+X right, -Y up, +Z forward toward viewer):
+    # visible faces are those whose centroid points in (+1, -1, +1) from box centroid.
+    CAM_DIR = (1.0, -1.0, 1.0)
+    # 6 faces of a local bbox, each as 4 corner indices (CCW from outside).
+    # Local frame: top at y=-h, bottom at y=0, length along x, depth along z.
+    # Corner indexing: 0..3 = top (y=-h), 4..7 = bottom (y=0), each ring CCW
+    # viewed from +Y (bottom) / -Y (top): (-x,-z), (+x,-z), (+x,+z), (-x,+z).
+    BOX_FACES = {
+        "top":    (0, 3, 2, 1),  # y = -h, normal = -Y
+        "bottom": (4, 5, 6, 7),  # y =  0, normal = +Y
+        "east":   (1, 2, 6, 5),  # x = +w/2, normal = +X
+        "west":   (0, 4, 7, 3),  # x = -w/2, normal = -X
+        "south":  (2, 3, 7, 6),  # z = +d/2, normal = +Z
+        "north":  (0, 1, 5, 4),  # z = -d/2, normal = -Z
+    }
+    FACE_SHADE = {  # match the axis-aligned path's brightness convention
+        "top":    1.10,
+        "bottom": 0.85,
+        "east":   0.85,
+        "west":   0.85,
+        "south":  0.70,
+        "north":  0.70,
+    }
+
+    def _render_oriented_box(inst, part, rgb_face):
+        """Draw a part as an oriented box. Used when inst.matrix is set
+        (non-axis-aligned rotation, e.g. tilted hull plating). Skips face
+        coverage culling and studs — the goal is to keep the silhouette
+        correct, which is what dominates the visual at this scale."""
+        w, h, dd = part.width, part.height, part.depth
+        # 8 local corners. Indexing matches BOX_FACES above.
+        local = [
+            (-w/2, -h, -dd/2),  # 0
+            ( w/2, -h, -dd/2),  # 1
+            ( w/2, -h,  dd/2),  # 2
+            (-w/2, -h,  dd/2),  # 3
+            (-w/2,  0, -dd/2),  # 4
+            ( w/2,  0, -dd/2),  # 5
+            ( w/2,  0,  dd/2),  # 6
+            (-w/2,  0,  dd/2),  # 7
+        ]
+        m = effective_matrix(inst)
+        world_corners = []
+        for lx, ly, lz in local:
+            wx, wy, wz = matrix_apply(m, (lx, ly, lz))
+            world_corners.append((wx + inst.x, wy + inst.y, wz + inst.z))
+        cx = sum(c[0] for c in world_corners) / 8.0
+        cy = sum(c[1] for c in world_corners) / 8.0
+        cz = sum(c[2] for c in world_corners) / 8.0
+        for face_name, idx in BOX_FACES.items():
+            corners = [world_corners[i] for i in idx]
+            fcx = sum(c[0] for c in corners) / 4.0
+            fcy = sum(c[1] for c in corners) / 4.0
+            fcz = sum(c[2] for c in corners) / 4.0
+            # Outward dot with camera direction; >0 means camera-facing.
+            dot = (fcx - cx) * CAM_DIR[0] + (fcy - cy) * CAM_DIR[1] + (fcz - cz) * CAM_DIR[2]
+            if dot <= 0:
+                continue
+            _emit_face(corners, _shade(rgb_face, FACE_SHADE[face_name]))
+            _emit_edge(corners)
 
     def _emit_edge(corners3d: list[tuple[float, float, float]], style: str = "solid") -> None:
         closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
@@ -309,6 +371,14 @@ def render_model_png(
         is_ghost = built_set is not None and inst.instance_id not in built_set
         if is_ghost:
             rgb = _ghost(rgb)
+
+        # Parts with a non-canonical rotation matrix (imported from external
+        # LDraw files that use tilted/3D-rotated sub-modules) need to draw as
+        # their actual oriented box, not as their world-space AABB.
+        if inst.matrix is not None:
+            _render_oriented_box(inst, part, rgb)
+            continue
+
         w, h, d = (xmax - xmin), (ymax - ymin), (zmax - zmin)
         top_covers = _face_is_fully_covered("top", aabb, all_aabbs)
         east_covers = _face_is_fully_covered("east", aabb, all_aabbs)

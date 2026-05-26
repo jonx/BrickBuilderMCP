@@ -83,6 +83,24 @@ class PartInstance:
     z: float
     rotation: str = "identity"
     subassembly: str = "main"   # named group this part belongs to
+    # When importing models authored elsewhere, sub-file references can carry
+    # rotation matrices that aren't one of the 6 canonical rotations (small
+    # tilts, full 3D rotations). We preserve the raw 9-float row-major matrix
+    # here so render/export stay lossless. When set, `matrix` is the truth
+    # and `rotation` is a placeholder ("identity"). When None, `rotation` is
+    # authoritative — the normal authored-by-our-tools flow.
+    matrix: tuple[float, float, float, float, float, float, float, float, float] | None = None
+
+
+def effective_matrix(inst: PartInstance) -> Matrix:
+    """Return the rotation matrix the renderer/exporter should use for `inst`.
+
+    `inst.matrix` (raw 9-float) takes precedence if set; otherwise fall back
+    to the named canonical rotation via `resolve_rotation`.
+    """
+    if inst.matrix is not None:
+        return inst.matrix  # type: ignore[return-value]
+    return resolve_rotation(inst.rotation)
 
 
 @dataclass
@@ -199,7 +217,7 @@ def part_aabb_world(inst: PartInstance, part: Part) -> tuple[tuple[float, float,
              for sx in (-w / 2, w / 2)
              for sy in (-h, 0)
              for sz in (-d / 2, d / 2)]
-    m = resolve_rotation(inst.rotation)
+    m = effective_matrix(inst)
     rotated = [matrix_apply(m, c) for c in local]
     xs = [p[0] for p in rotated]
     ys = [p[1] for p in rotated]
@@ -275,22 +293,26 @@ _TYPE1_RE = re.compile(
     r"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+"
     r"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+"
     r"(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+(-?\d+\.?\d*)\s+"
-    r"(.+\.dat)\s*$",
+    r"(.+\.(?:dat|ldr|mpd))\s*$",
     re.IGNORECASE,
 )
 
 
-def _matrix_to_rotation_name(m: Matrix) -> str:
-    """Best-effort reverse lookup of a name for a matrix; falls back to 'identity' (with a warning) if exotic."""
+def _matrix_to_rotation_name(m: Matrix) -> str | None:
+    """Reverse-lookup a canonical rotation name for a 9-float matrix.
+
+    Returns the name if it matches one of the 6 canonical rotations within
+    tolerance; otherwise returns None so the caller can preserve the raw
+    matrix on the PartInstance.
+    """
     for name, ref in ROTATIONS.items():
         if all(abs(a - b) < 1e-3 for a, b in zip(m, ref)):
             return name
-    log.warning("Imported matrix doesn't match any canonical rotation; storing as identity.")
-    return "identity"
+    return None
 
 
 def _emit_inst_line(inst: PartInstance) -> str:
-    m = resolve_rotation(inst.rotation)
+    m = effective_matrix(inst)
     return (f"1 {inst.color} {inst.x:g} {inst.y:g} {inst.z:g} "
             + " ".join(f"{v:g}" for v in m)
             + f" {inst.part_id}.dat")
@@ -407,15 +429,20 @@ def parse_ldr_text(text: str) -> list[PartInstance]:
                 continue
             # Plain part reference. Apply the block's accumulated transform.
             world = _compose_transform(transform, (x, y, z) + mat)
-            rot_name = _matrix_to_rotation_name(world[3:12])  # type: ignore[arg-type]
-            results.append(PartInstance(
+            world_mat = world[3:12]
+            rot_name = _matrix_to_rotation_name(world_mat)  # type: ignore[arg-type]
+            inst = PartInstance(
                 instance_id="0",  # caller will assign
                 part_id=part_stem,
                 color=color,
                 x=world[0], y=world[1], z=world[2],
-                rotation=rot_name,
+                rotation=rot_name or "identity",
                 subassembly=name,
-            ))
+            )
+            if rot_name is None:
+                # Non-canonical rotation — preserve the raw matrix verbatim.
+                inst.matrix = world_mat  # type: ignore[assignment]
+            results.append(inst)
         return results
 
     identity = (0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
@@ -456,6 +483,8 @@ def _compose_transform(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[floa
 
 def _inst_dict(inst: PartInstance) -> dict[str, Any]:
     d = asdict(inst)
+    if d.get("matrix") is None:
+        d.pop("matrix", None)
     p = PART_INDEX.get(inst.part_id)
     if p:
         d["part_name"] = p.name
@@ -684,9 +713,11 @@ def list_colors() -> dict[str, Any]:
 
 @mcp.tool()
 def parts_that_mount_on(part_id: str, limit: int = 20,
-                         min_studs_matched: int = 1) -> dict[str, Any]:
+                         min_studs_matched: int = 1,
+                         exclude_non_structural: bool = True) -> dict[str, Any]:
     """Reverse search: given a part ID, return up to `limit` other parts that
     can sit on top of it with at least `min_studs_matched` stud-receiver matings.
+    By default, sticker/print/decorative catalog entries are excluded.
 
     Indexed across the full catalog (~23k parts); first call builds the index
     (~1s), subsequent calls return in milliseconds. Use this to find wheels
@@ -696,27 +727,35 @@ def parts_that_mount_on(part_id: str, limit: int = 20,
     from lego_mcp.mount_index import parts_that_mount_on as _mount
     _ensure_library_loaded()
     target = _require_part(part_id)
+    excludes = (
+        "sticker", "decal", "pattern", "print", "sheet", "cardboard",
+        "catalog", "box", "poster",
+    ) if exclude_non_structural else ()
     results = _mount(target, PART_INDEX, limit=limit,
-                      min_studs_matched=min_studs_matched)
+                      min_studs_matched=min_studs_matched,
+                      exclude_keywords=excludes)
     return {"target": part_id, "target_name": target.name.strip(),
+            "exclude_non_structural": exclude_non_structural,
             "result_count": len(results),
             "results": results}
 
 
 @mcp.tool()
 def find_connections(part_a_id: str, part_b_id: str,
-                      full_nesting_only: bool = False) -> dict[str, Any]:
+                      full_nesting_only: bool = False,
+                      min_studs_matched: int = 1) -> dict[str, Any]:
     """Enumerate every valid LEGO connection between two parts.
 
     Returns the list of relative placements where B stacks on A (and vice
-    versa) with at least one stud-to-receptor mating. Set
-    full_nesting_only=True to keep only placements where ALL of B's
+    versa). Increase `min_studs_matched` to reduce noisy partial placements.
+    Set full_nesting_only=True to keep only placements where ALL of B's
     receptors mate (i.e. B's full footprint sits inside A's stud area).
     """
     from lego_mcp.connections import find_connections as _find
     a = _require_part(part_a_id)
     b = _require_part(part_b_id)
-    return _find(a, b, full_nesting_only=full_nesting_only)
+    return _find(a, b, full_nesting_only=full_nesting_only,
+                 min_studs_matched=min_studs_matched)
 
 
 # ---------------------------------------------------------------------------
@@ -882,13 +921,14 @@ def move_subassembly(name: str, dx: float = 0, dy: float = 0, dz: float = 0) -> 
 
 @mcp.tool()
 def analyze_assembly_ports(subassembly: str | None = None,
-                           max_connectors: int = 200,
+                           max_connectors: int = 0,
                            max_ports: int = 50) -> dict[str, Any]:
     """List exposed studs/receivers and clustered attachment ports.
 
     Args:
         subassembly: Optional subassembly name. Omit for the whole model.
         max_connectors: Cap detailed connector rows; counts still include all.
+            Defaults to 0 so normal responses stay port-focused.
         max_ports: Cap returned port clusters; largest ports are returned first.
     """
     from lego_mcp.assembly_ports import analyze_ports
@@ -1343,13 +1383,21 @@ def export_mpd(path: str) -> dict[str, Any]:
 @mcp.tool()
 def import_ldr(path: str) -> dict[str, Any]:
     """Load .ldr or .mpd. **Replaces the current model.** Clears undo/redo."""
+    _ensure_library_loaded()
     text = Path(path).expanduser().read_text()
     instances = parse_ldr_text(text)
     _reset_state(Path(path).stem, keep_checkpoints=True)
     for inst in instances:
         inst.instance_id = STATE.new_id()
         STATE.parts[inst.instance_id] = inst
-    return {"ok": True, "loaded": len(instances), "model": STATE.name}
+    known = sum(1 for i in instances if i.part_id in PART_INDEX)
+    return {
+        "ok": True,
+        "loaded": len(instances),
+        "known_parts": known,
+        "unknown_parts": len(instances) - known,
+        "model": STATE.name,
+    }
 
 
 @mcp.tool()
@@ -1490,6 +1538,8 @@ def list_projects() -> dict[str, Any]:
         return {"projects": []}
     projects = []
     for f in sorted(PROJECTS_DIR.glob("*.mpd")):
+        if f.stem.startswith("_"):
+            continue
         projects.append({"name": f.stem, "path": str(f),
                          "size_bytes": f.stat().st_size})
     return {"projects": projects, "dir": str(PROJECTS_DIR)}
@@ -1636,7 +1686,7 @@ try:
     @mcp.tool()
     def render_model(width: int = 800, height: int = 600,
                      color_mode: str = "model",
-                     hidden_edges: bool = True) -> list:
+                     hidden_edges: bool = False) -> list:
         """Render the model as an isometric PNG. Returns BOTH the image (inline
         for the LLM to see) AND a summary dict with the disk path.
 
@@ -1648,8 +1698,9 @@ try:
                 different color to each piece. "row" colors each brick course.
                 "rotation" colors by orientation.
             hidden_edges: draw fully covered/internal contact faces as dotted
-                guide lines.
+                guide lines. Defaults false for a cleaner inspection render.
         """
+        _ensure_library_loaded()
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges)
         summary, _img = _render_to_disk_and_image(png)
@@ -1660,11 +1711,12 @@ try:
     @mcp.tool()
     def render_progress(width: int = 800, height: int = 600,
                          color_mode: str = "model",
-                         hidden_edges: bool = True) -> list:
+                         hidden_edges: bool = False) -> list:
         """Render the build-in-progress: parts in STATE.built render normally,
         unbuilt parts show as ghosts (washed-out, no studs). Returns BOTH the
         image (inline for the LLM) AND a summary dict with built/total counts.
         """
+        _ensure_library_loaded()
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges,
                                built_set=STATE.built)
@@ -1700,6 +1752,7 @@ try:
         much faster than mapping ID lists from validate_model() onto positions.
         Returns [summary_dict, image] like render_model.
         """
+        _ensure_library_loaded()
         status = _validation_status_sets()
         STATUS_COLORS = {
             "ok":          (140, 200, 140),  # green

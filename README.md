@@ -230,6 +230,16 @@ All four return `[markdown_preview, summary_dict, MCPImage]` — the human sees 
 
 *`render_validation()` on a clean `build_room`: every part is green — no collisions, nothing floating, nothing off-grid. When something is wrong, the offending parts switch color (**red** = collision, **orange** = floating, **purple** = unanchored, **yellow** = off-grid, **gray** = unknown part_id) so you can spot problems at a glance.*
 
+#### The renderer scales: importing a 9,361-part Star Destroyer
+
+![Imperial Star Destroyer 10030 imported from the official LDraw model repository and rendered by LegoMCP — full triangular hull, bridge tower, and engine block visible at iso angle](docs/images/star_destroyer.png)
+
+*`import_ldr("10030-1.mpd")` followed by `render_model(1600, 1100)` on the **Imperial Star Destroyer (set 10030)**. 9,361 parts across 135 sub-modules, ~7,290 of them carrying non-canonical rotation matrices (the angled hull plating). Import: **0.09 s**. Render: **5.3 s** → 140 KB PNG.*
+
+> Builder mode isn't trained to design anything this complex yet — semantic tools for greebling, wing-plate panel boundaries, and curved-hull techniques are future work. But the **import + render path holds up at this scale** today: you can load any OMR model, inspect it, run validation on it, and start chipping away.
+>
+> LDraw model © Roland Dahl ([rolandd on the LDraw OMR](https://library.ldraw.org/omr/sets/308)), redistributable under [CCAL 2.0](https://www.ldraw.org/article/398.html). Downloaded from [library.ldraw.org/library/omr/10030-1.mpd](https://library.ldraw.org/library/omr/10030-1.mpd). The Imperial Star Destroyer is a trademark of Lucasfilm / The Walt Disney Company.
+
 ### Persistence: checkpoints / projects / autosave
 
 Three tiers — pick the right one:
@@ -355,6 +365,7 @@ tests/                  # 128 tests, pytest
 ## Known limitations
 
 - **Slope renderer is AABB.** Slopes draw as cuboids. Use `get_part_info(slope_id)`'s `orientation` block to reason about slope direction — that's the bigger reasoning win. True wedge geometry is a planned follow-up.
+- **Non-canonical-rotation parts are drawn as oriented cuboids** — the matrix is preserved, the box rotates correctly, but those parts don't participate in stud-mating connection analysis (the grid only makes sense axis-aligned). Fine for imported display, intentionally limited for new construction.
 - **Search is keyword-AND.** "vehicle base car chassis" returns 0; "chassis" alone returns lots. Workaround: use single concrete words. Semantic search is on the roadmap.
 - **Connection model is stud-only.** Pins / hinges / axles / clips need `!LDCAD CONN` parsing (LDCad-extended LDraw metadata). Phase 2.
 - **`mount_index` ranking is footprint-naive.** Often surfaces minifig-leg variants for small targets because they happen to share the footprint. A "kind=" filter (brick/plate/tile vs accessory) would help.
