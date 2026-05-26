@@ -3,6 +3,7 @@
 Subcommands:
     (no args)          start the MCP server on stdio
     install-library    download the LDraw parts library (~85 MB) to ~/Library/ldraw
+    render <file> ...  render an .ldr / .mpd file to PNG (see `render -h`)
     -h | --help        print this help
 """
 
@@ -20,6 +21,9 @@ def main() -> None:
         from lego_mcp.parts import install_library
         install_library()
         return
+    if args and args[0] == "render":
+        from lego_mcp.cli_render import render_cmd
+        sys.exit(render_cmd(args[1:]))
     from lego_mcp.server import run
     run()
 
