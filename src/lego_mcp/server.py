@@ -1455,6 +1455,38 @@ except ImportError:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _write_startup_placeholder(renders_dir: Path) -> None:
+    """Create the renders dir and seed latest.png with a placeholder so the
+    user can `open` it before the LLM has rendered anything."""
+    renders_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        # Empty file is at least openable as "no preview yet"
+        (renders_dir / "latest.png").write_bytes(b"")
+        return
+    img = Image.new("RGB", (640, 480), (245, 245, 248))
+    draw = ImageDraw.Draw(img)
+    lines = [
+        "LegoMCP",
+        f"{len(PART_INDEX)} parts loaded",
+        "",
+        "Waiting for the first render…",
+        "",
+        "Ask Claude to build something — every render_model",
+        "or render_progress call overwrites this file.",
+    ]
+    y = 140
+    for line in lines:
+        # Centered-ish with default font
+        draw.text((60, y), line, fill=(60, 60, 70))
+        y += 28
+    import io
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    (renders_dir / "latest.png").write_bytes(buf.getvalue())
+
+
 def run() -> None:
     """Load the part library (built-in or installed), then serve over stdio."""
     _ensure_library_loaded()
@@ -1463,5 +1495,7 @@ def run() -> None:
     register_prompts(mcp)
     register_resources(mcp)
     register_helpers(mcp)
-    log.info("LegoMCP starting. %d parts loaded.", len(PART_INDEX))
+    rd = _renders_dir()
+    _write_startup_placeholder(rd)
+    log.info("LegoMCP starting. %d parts loaded. Renders -> %s", len(PART_INDEX), rd)
     mcp.run()
