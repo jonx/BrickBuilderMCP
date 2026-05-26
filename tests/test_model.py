@@ -73,6 +73,25 @@ def test_undo_after_redo_truncates_redo_stack():
     assert r["ok"] is False
 
 
+def test_state_mutates_in_place_across_create_import_restore():
+    """External code that holds a reference to STATE must keep seeing the
+    same object across create_model / import_ldr / restore_checkpoint."""
+    server.create_model("a")
+    captured = server.STATE
+    server.add_part("3001", "red", 0, 0, 0)
+
+    server.create_model("b")
+    assert captured is server.STATE
+    assert len(captured.parts) == 0  # external ref reflects the reset
+
+    server.add_part("3001", "blue", 0, 0, 0)
+    server.save_checkpoint("c1")
+    server.add_part("3001", "yellow", 40, 0, 0)
+    server.restore_checkpoint("c1")
+    assert captured is server.STATE
+    assert len(captured.parts) == 1
+
+
 def test_checkpoints():
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)

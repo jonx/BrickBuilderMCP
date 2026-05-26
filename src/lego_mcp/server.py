@@ -245,11 +245,21 @@ def _inst_dict(inst: PartInstance) -> dict[str, Any]:
 mcp = FastMCP("lego-mcp")
 
 
+def _reset_state(name: str, keep_checkpoints: bool = False) -> None:
+    """Reset STATE in place (don't rebind), so external references stay live."""
+    STATE.name = name
+    STATE.parts.clear()
+    STATE._next_id = 1
+    STATE._undo.clear()
+    STATE._redo.clear()
+    if not keep_checkpoints:
+        STATE._checkpoints.clear()
+
+
 @mcp.tool()
 def create_model(name: str = "untitled") -> dict[str, Any]:
     """Start a fresh, empty model. Clears parts, undo, redo, and checkpoints."""
-    global STATE
-    STATE = ModelState(name=name)
+    _reset_state(name)
     return {"ok": True, "name": name, "parts": 0}
 
 
@@ -403,10 +413,9 @@ def export_mpd(path: str) -> dict[str, Any]:
 @mcp.tool()
 def import_ldr(path: str) -> dict[str, Any]:
     """Load .ldr or .mpd. **Replaces the current model.** Clears undo/redo."""
-    global STATE
     text = Path(path).expanduser().read_text()
     instances = parse_ldr_text(text)
-    STATE = ModelState(name=Path(path).stem)
+    _reset_state(Path(path).stem, keep_checkpoints=True)
     for inst in instances:
         inst.instance_id = STATE.new_id()
         STATE.parts[inst.instance_id] = inst
@@ -448,13 +457,15 @@ def save_checkpoint(name: str) -> dict[str, Any]:
 @mcp.tool()
 def restore_checkpoint(name: str) -> dict[str, Any]:
     """Restore a previously saved checkpoint. Clears undo/redo."""
-    global STATE
     snap = STATE._checkpoints.get(name)
     if not snap:
         raise ValueError(f"No checkpoint {name!r}. Saved: {sorted(STATE._checkpoints)}")
-    saved_checkpoints = STATE._checkpoints
-    STATE = deepcopy(snap)
-    STATE._checkpoints = saved_checkpoints
+    STATE.name = snap.name
+    STATE.parts.clear()
+    STATE.parts.update(deepcopy(snap.parts))
+    STATE._next_id = snap._next_id
+    STATE._undo.clear()
+    STATE._redo.clear()
     return {"ok": True, "restored": name, "parts": len(STATE.parts)}
 
 

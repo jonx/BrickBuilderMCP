@@ -1,11 +1,14 @@
-"""Renderer smoke."""
+"""Renderer smoke. Renders go to a temp dir, not the project renders/ folder."""
 
 from __future__ import annotations
+
+import os
 
 from lego_mcp import server
 
 
-def test_renderer_produces_png():
+def test_renderer_produces_png(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     server.create_model()
     server.add_part("3001", "red", 0, 0, 0)
     server.add_part("3001", "blue", 0, -24, 0)
@@ -15,11 +18,14 @@ def test_renderer_produces_png():
     from pathlib import Path
     p = Path(r["path"])
     assert p.exists()
-    assert p.stat().st_size > 1000  # at least a real PNG, not empty
+    assert p.stat().st_size > 1000
     assert p.read_bytes().startswith(b"\x89PNG")
+    # Sanity: written under the temp cwd, not project root.
+    assert str(p).startswith(str(tmp_path))
 
 
-def test_renderer_empty_model():
+def test_renderer_empty_model(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     server.create_model()
     r = server.render_model(200, 150)
     assert r["ok"]
