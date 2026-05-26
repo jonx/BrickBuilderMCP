@@ -9,12 +9,9 @@ def test_build_wall_running_bond_alternates():
     server.create_model()
     r = helpers.build_wall(0, 0, 320, 0, height_rows=2, color="red", bond="running")
     assert r["ok"]
-    # 320 LDU / 80-LDU bricks = 4 full bricks per row. Running bond may drop
-    # one at the offset row.
-    assert r["rows"][0] >= 3
-    assert r["bricks"] >= 6
-    # Validate the wall is collision-free (the helper should not overlap bricks
-    # within the same row).
+    # New shape: rows is a list of {y, bricks, seams}. >=3 bricks per row.
+    assert r["bricks_placed"] >= 6
+    assert r["rows"][0]["bricks"] >= 3
     v = server.validate_model()
     assert v["summary"]["collisions"] == 0
 
@@ -23,7 +20,7 @@ def test_build_wall_z_running_works_too():
     server.create_model()
     r = helpers.build_wall(0, 0, 0, 320, height_rows=2, color="blue", bond="stretcher")
     assert r["ok"]
-    assert r["bricks"] >= 6
+    assert r["bricks_placed"] >= 6
     v = server.validate_model()
     assert v["summary"]["collisions"] == 0
 

@@ -782,19 +782,28 @@ def _cell_keys(aabb: tuple) -> list[tuple[int, int, int]]:
             for iz in range(iz0, iz1 + 1)]
 
 
+_GRID_XZ = 10.0   # LDU. Brick centers land on the half-stud grid by convention.
+_GRID_Y = 4.0     # LDU. Bottom face Y lands on quarter-plate grid (baseplate top at -4, plate-tops at multiples of 4 from there).
+
+
+def _grid_aligned(v: float, grid: float) -> bool:
+    """True if v is within 0.1 LDU of a multiple of `grid`."""
+    return abs(v - round(v / grid) * grid) < 0.1
+
+
+def _nearest_grid(v: float, grid: float) -> float:
+    return round(v / grid) * grid
+
+
 @mcp.tool()
 def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[str, Any]:
-    """Check for unknown parts, AABB collisions, and (optionally) floating parts.
-
-    Spatial grid bucketing keeps collision detection O(n) even at thousands of
-    parts. Floating-part detection uses the same grid to find which parts could
-    support each candidate (vertical neighbors with >= 1 stud of XZ overlap).
-    A part is "supported" if it sits on the ground plane (y=0) or on at least
-    one stud of another part below.
+    """Validate the model: collisions, unknown parts, floating, unanchored,
+    grid-alignment. Returns a compact 9-field report + structured errors with
+    repair suggestions where applicable.
 
     Args:
         max_errors: cap on the returned error list. Counts still cover everything.
-        check_support: include floating-part errors.
+        check_support: include connectivity-based floating + unanchored checks.
     """
     errors: list[dict[str, Any]] = []
     unknown_count = 0
@@ -835,80 +844,83 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
 
     floating_count = 0
     unanchored_count = 0
+    grid_errors = 0
+    edges_count = 0
+    from lego_mcp.connection_graph import (
+        find_floating_and_unanchored, vertical_seam_score, wall_bond_quality,
+    )
     if check_support:
-        # Build a connectivity graph: for each part, list other parts it has a
-        # valid LEGO connection to (top-bottom face match with >= 1 stud overlap).
-        neighbors: dict[str, set[str]] = {iid: set() for iid in aabbs}
-        grounded: set[str] = set()
-        for iid, ab in aabbs.items():
-            if abs(ab[1][1] - GROUND_Y) < SUPPORT_TOL:
-                grounded.add(iid)
-            # Candidate connection partners: parts in nearby cells.
-            cand_ids: set[str] = set()
-            for key in _cell_keys(ab):
-                for other in grid.get(key, []):
-                    if other != iid:
-                        cand_ids.add(other)
-            # Also one cell above and below.
-            (xmin, ymin, zmin), (xmax, ymax, zmax) = ab
-            extended = ((xmin, ymin - CELL_SIZE, zmin), (xmax, ymax + CELL_SIZE, zmax))
-            for key in _cell_keys(extended):
-                for other in grid.get(key, []):
-                    if other != iid:
-                        cand_ids.add(other)
-            for other in cand_ids:
-                other_ab = aabbs[other]
-                # Connected if top-bottom face match either direction with
-                # sufficient XZ overlap.
-                connected = False
-                if (abs(ab[1][1] - other_ab[0][1]) < SUPPORT_TOL
-                        and xz_overlap_area(ab, other_ab) >= MIN_SUPPORT_AREA):
-                    connected = True
-                if (abs(other_ab[1][1] - ab[0][1]) < SUPPORT_TOL
-                        and xz_overlap_area(ab, other_ab) >= MIN_SUPPORT_AREA):
-                    connected = True
-                if connected:
-                    neighbors[iid].add(other)
+        graph, edges, anchors, floating_ids, unanchored_ids = find_floating_and_unanchored(STATE.parts)
+        edges_count = len(edges)
+        floating_count = len(floating_ids)
+        unanchored_count = len(unanchored_ids)
+        for iid in sorted(floating_ids):
+            inst = STATE.parts.get(iid)
+            if inst is None:
+                continue
+            if len(errors) < max_errors:
+                errors.append({
+                    "type": "floating_part",
+                    "instanceId": iid,
+                    "message": f"Part {iid} ({inst.part_id}) has no valid connection to the model.",
+                    "suggestion": _suggest_for_floating(inst),
+                })
+        for iid in sorted(unanchored_ids):
+            if len(errors) < max_errors:
+                errors.append({
+                    "type": "unanchored",
+                    "instanceId": iid,
+                    "message": f"Part {iid} is connected to neighbors but its island doesn't reach the ground.",
+                    "suggestion": "Add a connection to a grounded part or extend a wall down to a baseplate.",
+                })
 
-        # Per-part "floating" = no local connection and not grounded.
-        for iid in aabbs:
-            if iid not in grounded and not neighbors[iid]:
-                floating_count += 1
-                if len(errors) < max_errors:
-                    errors.append({"type": "floating", "instance_id": iid,
-                                   "note": "No connection on top or bottom face."})
+    # Grid-alignment check (X/Z to half-stud, Y to quarter-plate).
+    for inst in STATE.parts.values():
+        if not (_grid_aligned(inst.x, _GRID_XZ) and _grid_aligned(inst.z, _GRID_XZ)
+                 and _grid_aligned(inst.y, _GRID_Y)):
+            grid_errors += 1
+            if len(errors) < max_errors:
+                nx = _nearest_grid(inst.x, _GRID_XZ)
+                nz = _nearest_grid(inst.z, _GRID_XZ)
+                ny = _nearest_grid(inst.y, _GRID_Y)
+                errors.append({
+                    "type": "invalid_grid_alignment",
+                    "instanceId": inst.instance_id,
+                    "message": (f"Part {inst.instance_id} at ({inst.x},{inst.y},{inst.z}) "
+                                f"is off-grid; nearest grid is ({nx},{ny},{nz})."),
+                    "suggestion": (f"Move part {inst.instance_id} by "
+                                   f"({nx - inst.x:+g}, {ny - inst.y:+g}, {nz - inst.z:+g}) LDU."),
+                })
 
-        # BFS from grounded parts. Anything unreachable is an unanchored island.
-        reachable = set(grounded)
-        queue = list(grounded)
-        while queue:
-            iid = queue.pop()
-            for n in neighbors[iid]:
-                if n not in reachable:
-                    reachable.add(n)
-                    queue.append(n)
-        for iid in aabbs:
-            if iid not in reachable and iid not in grounded:
-                # Don't double-count single floating bricks already counted above.
-                if neighbors[iid]:  # has neighbors but the island doesn't reach ground
-                    unanchored_count += 1
-                    if len(errors) < max_errors:
-                        errors.append({"type": "unanchored", "instance_id": iid,
-                                       "note": "Connected to neighbors but the island doesn't reach the ground."})
+    seam_score = vertical_seam_score(STATE.parts)
+    bond_quality = wall_bond_quality(STATE.parts)
 
-    issue_count = collision_count + unknown_count + floating_count + unanchored_count
+    issue_count = collision_count + unknown_count + floating_count + unanchored_count + grid_errors
     return {
         "valid": issue_count == 0,
         "errors": errors,
         "summary": {
             "parts": len(STATE.parts),
+            "connections": edges_count,
             "collisions": collision_count,
             "unknown_parts": unknown_count,
             "floating": floating_count,
             "unanchored": unanchored_count,
+            "grid_alignment_errors": grid_errors,
+            "vertical_seam_score": seam_score,
+            "wall_bond_quality": round(bond_quality, 3),
             "errors_truncated": issue_count > len(errors),
         },
     }
+
+
+def _suggest_for_floating(inst) -> str:
+    """Best-effort repair suggestion."""
+    plate_y_options = [-4, -12, -28, -52, -76]
+    nearest = min(plate_y_options, key=lambda y: abs(y - inst.y))
+    if abs(nearest - inst.y) < 30 and nearest != inst.y:
+        return f"Move part {inst.instance_id} from y={inst.y} to y={nearest} (nearest stack-aligned Y)."
+    return f"Place a supporting brick directly below part {inst.instance_id}."
 
 
 @mcp.tool()

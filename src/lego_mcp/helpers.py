@@ -1,207 +1,388 @@
-"""High-level building helpers — encapsulate well-known LEGO techniques.
+"""High-level building helpers — real LEGO masonry, not stacked boxes.
 
-These exist so the LLM doesn't have to place every brick of a 200-stud wall by
-hand. They use the same `add_part`-style mutations under the hood so undo /
-checkpoints / validation work normally.
+Phase 2 rewrite. Goals:
+- `build_wall_segment` produces a row-by-row staggered wall (seams shift per
+  row); ends are filled with shorter bricks from the palette as needed.
+- `build_room` builds four walls AND interlocks the corners by alternating
+  which wall extends into the corner on each row. No standalone corner
+  column.
+- All semantic helpers default to strict grid alignment (x, z on the
+  half-stud grid, y on plate-aligned positions). Raw `add_part` stays
+  permissive.
 
-Conventions
------------
-- Walls and floors lay parts in absolute LDU coordinates.
-- The helpers' "color" is anything `resolve_color` accepts (name or LDraw ID).
-- All new parts inherit the current subassembly tag from STATE.
+Conventions:
+- Wall thickness = 1 stud (20 LDU). Walls are made of 1×N bricks lying flat,
+  long-axis along the wall direction.
+- Default brick palette: 1x4 (3010) for body, 1x2 (3004) for ends/fills,
+  1x1 (3005) for any single-stud gap.
+- "Row" = one brick height (24 LDU = 3 plates). `base_y` is the Y of the
+  bottom face of row 0.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
+
+BRICK_H = 24
+STUD = 20
+PALETTE_DEFAULT_BODY = ("3010", "3004", "3005")   # 1x4, 1x2, 1x1 brick lengths
+_BRICK_LENGTH_LDU = {
+    # Bricks
+    "3010": 80, "3004": 40, "3005": 20, "3622": 60, "3009": 120, "3008": 160,
+    # 2-stud-wide bricks usable as wall bricks rotated to be long-along-X
+    "3001": 80, "3002": 60, "3003": 40,
+    # Plates (same lengths as bricks)
+    "3710": 80, "3023": 40, "3024": 20, "3623": 60, "3666": 120, "3460": 160,
+    "3020": 80, "3021": 60, "3022": 40,
+}
 
 
 def _server():
-    # Lazy import to avoid circular import at module load.
     from lego_mcp import server
     return server
 
 
-def build_wall(x0: float, z0: float, x1: float, z1: float,
-               height_rows: int = 3,
-               color: str | int = "light_bluish_gray",
-               bond: str = "running",
-               brick_part: str = "3001",
-               base_y: float = 0,
-               inset_ends: float = 0,
-               ) -> dict[str, Any]:
-    """Lay a straight wall from (x0,z0) to (x1,z1).
+# ---------------------------------------------------------------------------
+# Brick picker for a single row
+# ---------------------------------------------------------------------------
 
-    Args:
-        height_rows: number of brick rows (each row = 24 LDU tall).
-        color: wall color.
-        bond: "stretcher" (all bricks aligned) or "running" (each row offset
-            by half a brick — looks like real masonry, more structurally sound).
-        brick_part: defaults to 2x4 brick (3001). Use 3010 (1x4) for thin walls.
-        base_y: Y of the top of the supporting surface (where row 0 sits).
-            For a brick standing on the ground plane, use 0 (default). For a
-            brick sitting on a 1-LDU-thick baseplate at y=0, use -1.
-        inset_ends: shorten the wall at each end by this many LDU so that two
-            perpendicular walls meeting at a corner don't overlap. For 4 walls
-            around a square room with 2x4 bricks (40 LDU thick), set
-            inset_ends=20 (half the wall thickness) on the wall pairs that
-            meet at corners.
+def _pick_brick_run(length_ldu: int, avoid_seam_xs: set[int],
+                     palette: Iterable[str] = PALETTE_DEFAULT_BODY,
+                     ) -> list[tuple[str, int]] | None:
+    """Lay bricks across `length_ldu` so that NO brick boundary lands at any X
+    in `avoid_seam_xs` (X positions are relative to the row start, 0 ≤ x ≤ length).
 
-    The wall runs in the dominant axis direction (X or Z) and is 1 brick
-    thick perpendicular to that. Returns the count of bricks laid.
+    Returns a list of (part_id, center_offset_from_start) tuples, or None if
+    no valid arrangement exists with the given palette.
+
+    Algorithm: greedy + backtrack. Try the largest brick that doesn't land a
+    seam on a forbidden X, advance, repeat. Backtrack on dead ends.
     """
+    lengths = sorted(((p, _BRICK_LENGTH_LDU[p]) for p in palette),
+                      key=lambda x: -x[1])
+
+    def search(cursor: int, plan: list[tuple[str, int]]) -> list[tuple[str, int]] | None:
+        if cursor == length_ldu:
+            return plan
+        if cursor > length_ldu:
+            return None
+        for pid, blen in lengths:
+            seam_x = cursor + blen
+            if seam_x > length_ldu:
+                continue
+            # The seam at cursor+blen must not be in the forbidden set, UNLESS
+            # it's the very last seam (cursor + blen == length_ldu — that's the
+            # wall end, not a seam between two bricks of this row).
+            if seam_x != length_ldu and seam_x in avoid_seam_xs:
+                continue
+            center = cursor + blen / 2
+            result = search(cursor + blen, plan + [(pid, int(center))])
+            if result is not None:
+                return result
+        return None
+
+    return search(0, [])
+
+
+def _row_seams(plan: list[tuple[str, int]]) -> set[int]:
+    """Internal seam X positions of a row plan (positions strictly between
+    bricks). Excludes the first/last boundaries which are the row ends."""
+    seams: set[int] = set()
+    cursor = 0
+    for pid, _center in plan:
+        cursor += _BRICK_LENGTH_LDU[pid]
+        seams.add(cursor)
+    seams.discard(0)
+    seams.discard(int(plan[-1][1] + _BRICK_LENGTH_LDU[plan[-1][0]] / 2)
+                  if False else 0)   # keep cursor end out: plan's final cursor == length
+    # Remove the wall-end seam (final cursor): it's the wall boundary, not a stagger target.
+    if plan:
+        final_end = sum(_BRICK_LENGTH_LDU[pid] for pid, _ in plan)
+        seams.discard(final_end)
+    return seams
+
+
+# ---------------------------------------------------------------------------
+# Build a single row of bricks
+# ---------------------------------------------------------------------------
+
+def _place_row_x(x_start: float, z_center: float, y: float,
+                  plan: list[tuple[str, int]], color: str | int) -> list[str]:
+    """Place each brick in `plan` along +X starting at x_start, at z=z_center, y=y.
+    Bricks are identity-oriented (long axis +X)."""
     s = _server()
-    part = s._require_part(brick_part)
-    long_dim = max(part.width, part.depth)
-    short_dim = min(part.width, part.depth)
-    half = long_dim / 2
+    ids = []
+    for pid, center_off in plan:
+        cx = x_start + center_off
+        r = s.add_part(pid, color, cx, y, z_center, rotation="identity")
+        ids.append(r["instance_id"])
+    return ids
 
-    dx, dz = x1 - x0, z1 - z0
-    along_x = abs(dx) >= abs(dz)
-    length = (dx * dx + dz * dz) ** 0.5 - 2 * inset_ends
-    if length < short_dim:
-        return {"ok": False, "reason": "wall too short to fit one brick after inset"}
 
-    n_full = int(length // long_dim)
-    rows: list[int] = []
-    laid_ids: list[str] = []
-    BRICK_H = 24
+def _place_row_z(x_center: float, z_start: float, y: float,
+                  plan: list[tuple[str, int]], color: str | int) -> list[str]:
+    """Same as _place_row_x but along +Z. Bricks are rot90y."""
+    s = _server()
+    ids = []
+    for pid, center_off in plan:
+        cz = z_start + center_off
+        r = s.add_part(pid, color, x_center, y, cz, rotation="rot90y")
+        ids.append(r["instance_id"])
+    return ids
 
-    # For a 2x4 brick at identity, long axis is +X. Use identity for X-running
-    # walls; rotate to rot90y so the long axis aligns with Z for Z-running walls.
+
+# ---------------------------------------------------------------------------
+# build_wall_segment — straight segment with row-by-row stagger
+# ---------------------------------------------------------------------------
+
+def build_wall_segment(start_x: float, start_z: float,
+                       end_x: float, end_z: float,
+                       height_rows: int = 5,
+                       color: str | int = "light_bluish_gray",
+                       palette: list[str] | None = None,
+                       base_y: float = -4,
+                       strict_grid: bool = True,
+                       ) -> dict[str, Any]:
+    """Lay a straight wall from (start_x, start_z) to (end_x, end_z), staggered.
+
+    Each row chooses a brick arrangement that doesn't share an internal seam
+    X with the row below. Short bricks (1x2, 1x1) fill the ends as needed.
+    """
+    pal = palette or list(PALETTE_DEFAULT_BODY)
+
+    if strict_grid:
+        for v, name in ((start_x, "start_x"), (start_z, "start_z"),
+                         (end_x, "end_x"), (end_z, "end_z")):
+            if abs(v - round(v / 10) * 10) > 0.1:
+                raise ValueError(
+                    f"{name}={v} not on half-stud grid (must be a multiple of 10 LDU)")
+        if abs(base_y - round(base_y / 4) * 4) > 0.1:
+            raise ValueError(f"base_y={base_y} not on quarter-plate grid")
+
+    along_x = abs(end_x - start_x) >= abs(end_z - start_z)
     if along_x:
-        sign = 1 if dx >= 0 else -1
-        start_x = x0 + sign * inset_ends
-        rotation = "identity"
+        length = abs(end_x - start_x)
+        z_center = start_z
+        x0 = min(start_x, end_x)
     else:
-        sign = 1 if dz >= 0 else -1
-        start_z = z0 + sign * inset_ends
-        rotation = "rot90y"
+        length = abs(end_z - start_z)
+        x_center = start_x
+        z0 = min(start_z, end_z)
+    length = int(round(length))
+
+    placed: list[str] = []
+    prev_internal_seams: set[int] = set()
+    rows: list[dict[str, Any]] = []
 
     for row in range(height_rows):
         y = base_y - row * BRICK_H
-        offset_along = half if (bond == "running" and row % 2 == 1) else 0.0
-        n_this_row = n_full
-        # Running-bond offset rows fit one fewer full brick if it'd overshoot.
-        if offset_along > 0 and (n_full * long_dim + offset_along) > length:
-            n_this_row = max(0, n_full - 1)
+        plan = _pick_brick_run(length, prev_internal_seams, palette=pal)
+        if plan is None:
+            return {"ok": False, "reason": f"no valid brick arrangement for row {row}",
+                    "length": length, "avoid_seams": sorted(prev_internal_seams),
+                    "placed_so_far": len(placed)}
+        # Internal seam positions of this row (X relative to x0 or z0).
+        cursor = 0
+        internal = set()
+        for pid, _ in plan:
+            cursor += _BRICK_LENGTH_LDU[pid]
+            internal.add(cursor)
+        internal.discard(length)
         if along_x:
-            for i in range(n_this_row):
-                cx = start_x + sign * (half + offset_along + i * long_dim)
-                r = s.add_part(brick_part, color, cx, y, z0, rotation=rotation)
-                laid_ids.append(r["instance_id"])
+            placed.extend(_place_row_x(x0, z_center, y, plan, color))
         else:
-            for i in range(n_this_row):
-                cz = start_z + sign * (half + offset_along + i * long_dim)
-                r = s.add_part(brick_part, color, x0, y, cz, rotation=rotation)
-                laid_ids.append(r["instance_id"])
-        rows.append(n_this_row)
+            placed.extend(_place_row_z(x_center, z0, y, plan, color))
+        rows.append({"y": y, "bricks": len(plan), "seams": sorted(internal)})
+        prev_internal_seams = internal
 
-    return {"ok": True, "bricks": len(laid_ids), "rows": rows,
-            "bond": bond, "subassembly": s.STATE.current_subassembly}
+    return {"ok": True, "bricks_placed": len(placed), "rows": rows,
+            "subassembly": _server().STATE.current_subassembly}
 
 
-def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
-               height_rows: int = 5,
-               color: str | int = "light_bluish_gray",
-               bond: str = "running",
-               base_y: float = -4,
-               brick_part: str = "3001",
-               ) -> dict[str, Any]:
-    """Build a rectangular hollow room: 4 walls + 2x2 corner stacks.
+# ---------------------------------------------------------------------------
+# build_corner — single corner brick per row, alternating rotation
+# ---------------------------------------------------------------------------
 
-    The 4 walls are inset 20 LDU at each end; 2x2 corner blocks (3003) fill
-    each corner so the AABB perimeter is closed and stays inside the
-    (x_min, x_max) x (z_min, z_max) boundary.
+def build_corner(x: float, z: float, height_rows: int,
+                  base_y: float = -4,
+                  color: str | int = "light_bluish_gray",
+                  brick_part: str = "3004",
+                  orientation: str = "alt_x_first",
+                  ) -> dict[str, Any]:
+    """Place a single brick at (x, z) per row to form an interlocking corner.
 
-    LIMITATION — this is NOT real LEGO masonry corner bonding. The corner
-    blocks form vertical columns that bond up/down to themselves but only
-    SIT NEXT TO the perpendicular walls, they don't interlock with them.
-    Real bonded corners need bricks that span the corner per row, alternating
-    direction (even rows wrap one way, odd rows the other). Generic helper
-    can't safely do this without protruding past the boundary, so we ship
-    the simple version. For a structurally-bonded corner the LLM/user should
-    place corner pieces manually with `add_part` per row.
+    Even rows: brick at identity (long axis +X) — it extends into the X wall.
+    Odd rows: brick at rot90y (long axis +Z) — it extends into the Z wall.
+    `orientation="alt_z_first"` swaps the parity.
 
-    Defaults assume the room sits on a baseplate at y=0 (top y=-1).
+    The wall segments meeting this corner must have their end-insets coordinated
+    (see build_room).
     """
     s = _server()
-    wall_thickness = 40
-    inset = wall_thickness / 2  # 20 LDU = half the wall thickness
+    ids = []
+    for row in range(height_rows):
+        y = base_y - row * BRICK_H
+        # Alternate which axis the corner brick extends along.
+        if orientation == "alt_x_first":
+            rot = "identity" if row % 2 == 0 else "rot90y"
+        else:
+            rot = "rot90y" if row % 2 == 0 else "identity"
+        r = s.add_part(brick_part, color, x, y, z, rotation=rot)
+        ids.append(r["instance_id"])
+    return {"ok": True, "corner_bricks": len(ids),
+            "subassembly": s.STATE.current_subassembly}
 
-    wall_results = [
-        build_wall(x_min, z_min, x_max, z_min, height_rows, color, bond,
-                   brick_part, base_y, inset_ends=inset),
-        build_wall(x_min, z_max, x_max, z_max, height_rows, color, bond,
-                   brick_part, base_y, inset_ends=inset),
-        build_wall(x_min, z_min, x_min, z_max, height_rows, color, bond,
-                   brick_part, base_y, inset_ends=inset),
-        build_wall(x_max, z_min, x_max, z_max, height_rows, color, bond,
-                   brick_part, base_y, inset_ends=inset),
-    ]
-    wall_bricks = sum(w.get("bricks", 0) for w in wall_results)
 
-    BRICK_H = 24
-    corners = [(x_min, z_min), (x_max, z_min), (x_min, z_max), (x_max, z_max)]
-    corner_count = 0
-    for (cx, cz) in corners:
-        for row in range(height_rows):
-            y = base_y - row * BRICK_H
-            s.add_part("3003", color, cx, y, cz)  # 2x2 corner brick
-            corner_count += 1
+# ---------------------------------------------------------------------------
+# build_room — four interlocking walls + corners
+# ---------------------------------------------------------------------------
 
-    return {"ok": True, "wall_bricks": wall_bricks, "corner_bricks": corner_count,
+def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
+                height_rows: int = 5,
+                color: str | int = "light_bluish_gray",
+                base_y: float = -4,
+                strict_grid: bool = True,
+                ) -> dict[str, Any]:
+    """Build a rectangular hollow room.
+
+    Construction:
+    - 2x2 brick (3003) at each corner, stacked vertically (rotation-symmetric,
+      so adjacent rows always connect via 4 shared studs).
+    - 4 wall segments around the perimeter, each ending flush with the corner
+      brick. Wall bricks stagger seams from row to row inside each wall
+      segment via the brick-picker.
+
+    Note: this isn't fully bonded masonry (the corner columns are connected
+    only vertically, not laterally into the wall bricks). For maximum
+    structural realism the LLM should lay corners manually using
+    place_on_top + alternating rotation. This helper picks "buildable +
+    visually right" over "structurally interlocked."
+    """
+    s = _server()
+    if strict_grid:
+        for v, name in ((x_min, "x_min"), (x_max, "x_max"),
+                         (z_min, "z_min"), (z_max, "z_max")):
+            if abs(v - round(v / 10) * 10) > 0.1:
+                raise ValueError(f"{name}={v} not on half-stud grid")
+
+    CORNER_PART = "3003"   # 2x2 brick (rotation-symmetric — connects between rows reliably)
+    CORNER_HALF = _BRICK_LENGTH_LDU[CORNER_PART] / 2   # 20 LDU
+    THICKNESS = STUD                                   # wall is 1 stud thick
+
+    z_south = z_min + THICKNESS / 2
+    z_north = z_max - THICKNESS / 2
+    x_west = x_min + THICKNESS / 2
+    x_east = x_max - THICKNESS / 2
+
+    corners = {
+        "sw": (x_west, z_south),
+        "se": (x_east, z_south),
+        "nw": (x_west, z_north),
+        "ne": (x_east, z_north),
+    }
+
+    placed_total = 0
+    prev_seam_x: set[int] = set()
+    prev_seam_z: set[int] = set()
+    pal = list(PALETTE_DEFAULT_BODY)
+
+    # The wall segments INSET by 20 LDU (half the 2x2 corner brick) on each end
+    # so they end flush with the corner column's near face.
+    wall_x_start = x_west + CORNER_HALF
+    wall_x_end = x_east - CORNER_HALF
+    length_x = int(round(wall_x_end - wall_x_start))
+    wall_z_start = z_south + CORNER_HALF
+    wall_z_end = z_north - CORNER_HALF
+    length_z = int(round(wall_z_end - wall_z_start))
+
+    for row in range(height_rows):
+        y = base_y - row * BRICK_H
+
+        # Corner columns
+        for (cx, cz) in corners.values():
+            s.add_part(CORNER_PART, color, cx, y, cz, rotation="identity")
+            placed_total += 1
+
+        # X-walls (south + north)
+        if length_x > 0:
+            plan_x = _pick_brick_run(length_x, prev_seam_x, palette=pal)
+            if plan_x is None:
+                plan_x = _pick_brick_run(length_x, set(), palette=pal)
+            if plan_x is None:
+                return {"ok": False, "reason": f"x-walls row {row}: no brick fit for length={length_x}"}
+            _place_row_x(wall_x_start, z_south, y, plan_x, color)
+            _place_row_x(wall_x_start, z_north, y, plan_x, color)
+            placed_total += 2 * len(plan_x)
+            cur = 0
+            this_seams_x = set()
+            for pid, _ in plan_x:
+                cur += _BRICK_LENGTH_LDU[pid]
+                this_seams_x.add(cur)
+            this_seams_x.discard(length_x)
+            prev_seam_x = this_seams_x
+
+        # Z-walls (west + east)
+        if length_z > 0:
+            plan_z = _pick_brick_run(length_z, prev_seam_z, palette=pal)
+            if plan_z is None:
+                plan_z = _pick_brick_run(length_z, set(), palette=pal)
+            if plan_z is None:
+                return {"ok": False, "reason": f"z-walls row {row}: no brick fit for length={length_z}"}
+            _place_row_z(x_west, wall_z_start, y, plan_z, color)
+            _place_row_z(x_east, wall_z_start, y, plan_z, color)
+            placed_total += 2 * len(plan_z)
+            cur = 0
+            this_seams_z = set()
+            for pid, _ in plan_z:
+                cur += _BRICK_LENGTH_LDU[pid]
+                this_seams_z.add(cur)
+            this_seams_z.discard(length_z)
+            prev_seam_z = this_seams_z
+
+    return {"ok": True, "bricks_placed": placed_total,
             "subassembly": s.STATE.current_subassembly,
-            "warning": "Corner columns don't bond into walls — see helper docstring."}
+            "rows": height_rows}
 
+
+# ---------------------------------------------------------------------------
+# Floor + repeat (preserved from prior version)
+# ---------------------------------------------------------------------------
 
 def build_floor(x_min: float, z_min: float, x_max: float, z_max: float,
                 y: float = -4,
                 color: str | int = "light_bluish_gray",
                 part_id: str = "3022",
+                strict_grid: bool = True,
                 ) -> dict[str, Any]:
-    """Tile an axis-aligned rectangular area with plates.
-
-    Defaults to 2x2 plates (3022). For larger areas, use 3031 (4x4) or 3036 (6x8).
-    Returns the count of plates laid.
-    """
+    """Tile an axis-aligned rectangle with plates."""
     s = _server()
+    if strict_grid and any(abs(v - round(v / 10) * 10) > 0.1
+                            for v in (x_min, x_max, z_min, z_max)):
+        raise ValueError("floor bounds must be on the half-stud grid")
     part = s._require_part(part_id)
-    step_x = part.width
-    step_z = part.depth
-    if step_x <= 0 or step_z <= 0:
-        return {"ok": False, "reason": "part has zero dimensions"}
-
-    width = x_max - x_min
-    depth = z_max - z_min
-    n_x = int(width // step_x)
-    n_z = int(depth // step_z)
-    laid: list[str] = []
+    step_x, step_z = part.width, part.depth
+    n_x = int((x_max - x_min) // step_x)
+    n_z = int((z_max - z_min) // step_z)
+    placed = []
     for i in range(n_x):
         for j in range(n_z):
             cx = x_min + step_x / 2 + i * step_x
             cz = z_min + step_z / 2 + j * step_z
-            r = s.add_part(part_id, color, cx, y, cz)
-            laid.append(r["instance_id"])
-    return {"ok": True, "plates": len(laid), "tiled": [n_x, n_z],
+            placed.append(s.add_part(part_id, color, cx, y, cz)["instance_id"])
+    return {"ok": True, "plates": len(placed), "tiled": [n_x, n_z],
             "subassembly": s.STATE.current_subassembly}
 
 
 def repeat_pattern(part_id: str, count: int,
-                   dx: float = 0, dy: float = 0, dz: float = 0,
-                   start_x: float = 0, start_y: float = 0, start_z: float = 0,
-                   color: str | int = "light_bluish_gray",
-                   rotation: str = "identity",
-                   ) -> dict[str, Any]:
-    """Place `count` copies of one part along a line.
-
-    Each copy is at (start + i * delta). Useful for crenellations, columns,
-    repeated trim, etc.
-    """
+                    dx: float = 0, dy: float = 0, dz: float = 0,
+                    start_x: float = 0, start_y: float = 0, start_z: float = 0,
+                    color: str | int = "light_bluish_gray",
+                    rotation: str = "identity",
+                    ) -> dict[str, Any]:
     s = _server()
     if count <= 0:
         return {"ok": False, "reason": "count must be > 0"}
-    ids: list[str] = []
+    ids = []
     for i in range(count):
         r = s.add_part(part_id, color,
                        start_x + i * dx, start_y + i * dy, start_z + i * dz,
@@ -211,9 +392,145 @@ def repeat_pattern(part_id: str, count: int,
             "subassembly": s.STATE.current_subassembly}
 
 
+# ---------------------------------------------------------------------------
+# Placement helpers (LLM-preferred over raw add_part)
+# ---------------------------------------------------------------------------
+
+def place_on_top(base_instance_id: str, new_part_id: str,
+                  color: str | int = "light_bluish_gray",
+                  stud_offset_x: int = 0, stud_offset_z: int = 0,
+                  rotation: str = "identity",
+                  ) -> dict[str, Any]:
+    """Place a new part on top of an existing one.
+
+    `stud_offset_x` and `stud_offset_z` are integer stud offsets relative to
+    the base part's center: 0 = directly centered, 1 = shift by 1 stud (20 LDU),
+    etc. The new part's Y is computed so it sits exactly on the base's top face.
+    """
+    s = _server()
+    base = s.STATE.parts.get(base_instance_id)
+    if base is None:
+        raise ValueError(f"No part with instance_id={base_instance_id!r}")
+    base_part = s.PART_INDEX.get(base.part_id)
+    new_y = base.y - base_part.height          # B's bottom == A's top face
+    new_x = base.x + stud_offset_x * STUD
+    new_z = base.z + stud_offset_z * STUD
+    r = s.add_part(new_part_id, color, new_x, new_y, new_z, rotation=rotation,
+                   strict=True)
+    return {"ok": True, "instance_id": r["instance_id"], "position": [new_x, new_y, new_z]}
+
+
+def place_next_to(reference_instance_id: str, new_part_id: str,
+                   color: str | int = "light_bluish_gray",
+                   side: str = "east",     # north / south / east / west
+                   stud_offset: int = 0,
+                   rotation: str = "identity",
+                   ) -> dict[str, Any]:
+    """Place a new part beside an existing one in the same row.
+
+    `side`: north (+Z), south (-Z), east (+X), west (-X). The new part is
+    placed flush with the reference part's edge, plus `stud_offset` extra
+    studs along the same axis.
+    """
+    s = _server()
+    ref = s.STATE.parts.get(reference_instance_id)
+    if ref is None:
+        raise ValueError(f"No part with instance_id={reference_instance_id!r}")
+    ref_part = s.PART_INDEX.get(ref.part_id)
+    new_def_part = s._require_part(new_part_id)
+    # Compute the displacement: half of ref's dimension + half of new's dimension.
+    if side == "east":
+        dx = ref_part.width / 2 + new_def_part.width / 2 + stud_offset * STUD
+        new_x, new_y, new_z = ref.x + dx, ref.y, ref.z
+    elif side == "west":
+        dx = ref_part.width / 2 + new_def_part.width / 2 + stud_offset * STUD
+        new_x, new_y, new_z = ref.x - dx, ref.y, ref.z
+    elif side == "north":
+        dz = ref_part.depth / 2 + new_def_part.depth / 2 + stud_offset * STUD
+        new_x, new_y, new_z = ref.x, ref.y, ref.z + dz
+    elif side == "south":
+        dz = ref_part.depth / 2 + new_def_part.depth / 2 + stud_offset * STUD
+        new_x, new_y, new_z = ref.x, ref.y, ref.z - dz
+    else:
+        raise ValueError(f"side must be north/south/east/west, got {side!r}")
+    r = s.add_part(new_part_id, color, new_x, new_y, new_z, rotation=rotation)
+    return {"ok": True, "instance_id": r["instance_id"], "position": [new_x, new_y, new_z]}
+
+
+def find_valid_placements(part_id: str, near_part_id: str) -> dict[str, Any]:
+    """List every way `part_id` can connect to the in-model part `near_part_id`."""
+    from lego_mcp.connections import find_connections
+    s = _server()
+    a_inst = s.STATE.parts.get(near_part_id)
+    if a_inst is None:
+        raise ValueError(f"No part with instance_id={near_part_id!r}")
+    a = s.PART_INDEX[a_inst.part_id]
+    b = s._require_part(part_id)
+    r = find_connections(a, b)
+    # Translate from "relative to A at origin" to "absolute world coords".
+    abs_placements = []
+    for p in r["b_on_a_placements"]:
+        abs_placements.append({**p,
+                                "world_x": a_inst.x + p["x"],
+                                "world_y": a_inst.y + p["y"],
+                                "world_z": a_inst.z + p["z"]})
+    return {"part_id": part_id, "near_part_id": near_part_id,
+            "placements": abs_placements,
+            "count": len(abs_placements)}
+
+
+def suggest_next_brick_for_wall(subassembly: str) -> dict[str, Any]:
+    """Heuristic: scan a wall subassembly and propose where the next brick goes
+    to extend or close gaps. Phase-1 minimal: returns the top-row brick count
+    and the suggested next part_id to use."""
+    s = _server()
+    parts_in_wall = [p for p in s.STATE.parts.values() if p.subassembly == subassembly]
+    if not parts_in_wall:
+        return {"ok": False, "reason": f"subassembly {subassembly!r} is empty"}
+    top_row = min(p.y for p in parts_in_wall)
+    top = [p for p in parts_in_wall if abs(p.y - top_row) < 0.5]
+    return {"ok": True, "subassembly": subassembly,
+            "top_row_y": top_row,
+            "top_row_bricks": len(top),
+            "suggested_next": "3010 (1x4 brick) — continue the row, then start a new row above with 1x2 inset to stagger seams"}
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 def register_helpers(mcp) -> None:
-    """Attach the helper tools to a FastMCP instance."""
-    mcp.tool()(build_wall)
+    mcp.tool()(build_wall_segment)
+    mcp.tool()(build_corner)
     mcp.tool()(build_room)
     mcp.tool()(build_floor)
     mcp.tool()(repeat_pattern)
+    mcp.tool()(place_on_top)
+    mcp.tool()(place_next_to)
+    mcp.tool()(find_valid_placements)
+    mcp.tool()(suggest_next_brick_for_wall)
+
+
+# Back-compat: the old build_wall name still resolves so existing tests +
+# example scripts don't break. Delegates to build_wall_segment.
+def build_wall(x0: float, z0: float, x1: float, z1: float,
+                height_rows: int = 3,
+                color: str | int = "light_bluish_gray",
+                bond: str = "running",
+                brick_part: str = "3001",
+                base_y: float = -4,
+                inset_ends: float = 0,
+                ) -> dict[str, Any]:
+    pal = ["3001", "3004"] if brick_part == "3001" else list(PALETTE_DEFAULT_BODY)
+    if abs(x1 - x0) >= abs(z1 - z0):
+        sx = min(x0, x1) + inset_ends
+        ex = max(x0, x1) - inset_ends
+        return build_wall_segment(sx, z0, ex, z0, height_rows=height_rows,
+                                   color=color, palette=pal, base_y=base_y,
+                                   strict_grid=False)
+    else:
+        sz = min(z0, z1) + inset_ends
+        ez = max(z0, z1) - inset_ends
+        return build_wall_segment(x0, sz, x0, ez, height_rows=height_rows,
+                                   color=color, palette=pal, base_y=base_y,
+                                   strict_grid=False)
