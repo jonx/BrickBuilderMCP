@@ -1592,6 +1592,22 @@ try:
                    "bytes": len(png)}
         return summary, MCPImage(data=png, format="png")
 
+    def _markdown_image(png: bytes, alt: str = "render") -> str:
+        """Build a markdown image-data-URI block. Claude Desktop renders this
+        inline in the chat UI (confirmed). The MCPImage block stays as well
+        so the LLM still gets the image as proper vision content."""
+        import base64
+        b64 = base64.b64encode(png).decode("ascii")
+        return f"![{alt}](data:image/png;base64,{b64})"
+
+    def _render_response(png: bytes, summary: dict[str, Any], alt: str = "render") -> list:
+        """Standard response: [markdown-inline-image, summary_dict, MCPImage].
+        Markdown so the human sees it inline in chat; MCPImage so the LLM
+        sees it as proper vision content for reasoning."""
+        return [_markdown_image(png, alt),
+                summary,
+                MCPImage(data=png, format="png")]
+
     @mcp.tool()
     def render_model(width: int = 800, height: int = 600,
                      color_mode: str = "model",
@@ -1611,10 +1627,10 @@ try:
         """
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges)
-        summary, img = _render_to_disk_and_image(png)
+        summary, _img = _render_to_disk_and_image(png)
         summary.update({"parts": len(STATE.parts), "width": width, "height": height,
                         "color_mode": color_mode, "hidden_edges": hidden_edges})
-        return [summary, img]
+        return _render_response(png, summary, alt="model")
 
     @mcp.tool()
     def render_progress(width: int = 800, height: int = 600,
@@ -1627,48 +1643,10 @@ try:
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                color_mode=color_mode, hidden_edges=hidden_edges,
                                built_set=STATE.built)
-        summary, img = _render_to_disk_and_image(png, name_suffix="_progress")
+        summary, _img = _render_to_disk_and_image(png, name_suffix="_progress")
         summary.update({"built": len(STATE.built), "total": len(STATE.parts),
                         "width": width, "height": height})
-        return [summary, img]
-
-    @mcp.tool()
-    def render_inline(width: int = 600, height: int = 400) -> list:
-        """EXPERIMENT: render + return markdown image-data-URI + file path in
-        the text portion of the tool response, in addition to the usual
-        MCPImage content block.
-
-        Hypothesis: if the chat client renders markdown inside tool-result
-        text blocks, the inline `![](data:image/png;base64,...)` will show
-        up in-conversation. If it doesn't show up the rendered MCPImage block
-        still works (that's the existing render_model behavior).
-
-        Use this once to confirm what the client supports, then we either
-        promote the markdown to render_model or fall back to file links.
-        """
-        import base64
-        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height)
-        summary, img = _render_to_disk_and_image(png, name_suffix="_inline")
-        b64 = base64.b64encode(png).decode("ascii")
-        data_uri = f"data:image/png;base64,{b64}"
-        file_uri = f"file://{summary['path']}"
-        markdown = (
-            f"![render]({data_uri})\n\n"
-            f"Saved to: `{summary['path']}`\n"
-            f"File link: [{summary['path'].split('/')[-1]}]({file_uri})"
-        )
-        summary["bytes"] = len(png)
-        summary["data_uri_bytes"] = len(data_uri)
-        summary["note"] = (
-            "If you see the rendered image just above this text, the chat "
-            "client honors markdown image URIs in tool results — we can "
-            "promote this to render_model. If you only see this text + "
-            "the inline image block (the third content), markdown URIs "
-            "aren't rendered; stick with the standard MCPImage path."
-        )
-        # Order matters: text first so the markdown is visible BEFORE the
-        # JSON summary; ImageContent stays last as a fallback.
-        return [markdown, summary, img]
+        return _render_response(png, summary, alt="progress")
 
     @mcp.tool()
     def view_latest_render() -> list:
@@ -1679,8 +1657,9 @@ try:
         if not latest.is_file():
             return [{"ok": False, "reason": "no render yet — call render_model first"}]
         png = latest.read_bytes()
-        return [{"ok": True, "path": str(latest), "bytes": len(png)},
-                MCPImage(data=png, format="png")]
+        return _render_response(png,
+                                 {"ok": True, "path": str(latest), "bytes": len(png)},
+                                 alt="latest")
 
     @mcp.tool()
     def render_validation(width: int = 900, height: int = 700) -> list:
@@ -1724,7 +1703,7 @@ try:
         png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
                                hidden_edges=False,
                                instance_color_override=override)
-        summary, img = _render_to_disk_and_image(png, name_suffix="_validation")
+        summary, _img = _render_to_disk_and_image(png, name_suffix="_validation")
         summary.update({
             "parts": len(STATE.parts),
             "ok": len(status["ok"]),
@@ -1735,7 +1714,7 @@ try:
             "unknown": len(status["unknown"]),
             "legend": {k: f"rgb{v}" for k, v in STATUS_COLORS.items()},
         })
-        return [summary, img]
+        return _render_response(png, summary, alt="validation")
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
 

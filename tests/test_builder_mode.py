@@ -141,8 +141,10 @@ def test_render_progress_writes_a_png(tmp_path, monkeypatch):
     server.start_builder_session()
     server.mark_built(base)
     result = server.render_progress(width=400, height=300)
-    # New shape: [summary, MCPImage]
-    summary, image = result
+    # Shape: [markdown_text, summary, MCPImage]
+    assert len(result) == 3
+    markdown, summary, image = result
+    assert isinstance(markdown, str) and markdown.startswith("![")
     assert summary["ok"]
     from pathlib import Path
     p = Path(summary["path"])

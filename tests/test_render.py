@@ -9,8 +9,13 @@ from lego_mcp import server
 
 
 def _summary_and_image(result):
-    """Pull the dict and MCPImage out of a render tool's [dict, image] return."""
-    summary, image = result
+    """Pull the markdown text, dict, and MCPImage out of a render tool's
+    [markdown, summary, image] return."""
+    assert len(result) == 3, f"expected 3 content blocks, got {len(result)}"
+    markdown, summary, image = result
+    assert isinstance(markdown, str)
+    assert markdown.startswith("!["), "first block should be markdown image"
+    assert "data:image/png;base64," in markdown, "should be inline data URI"
     assert isinstance(summary, dict)
     assert isinstance(image, MCPImage)
     return summary, image

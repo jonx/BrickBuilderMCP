@@ -92,7 +92,10 @@ def test_describe_errors_enriches_each():
 def test_render_validation_returns_image_and_legend(tmp_path, monkeypatch):
     monkeypatch.setenv("LEGO_MCP_RENDERS_DIR", str(tmp_path))
     _mixed_scene()
-    summary, img = server.render_validation(400, 300)
+    result = server.render_validation(400, 300)
+    assert len(result) == 3, "expected [markdown, summary, image]"
+    markdown, summary, img = result
+    assert markdown.startswith("![") and "data:image/png;base64," in markdown
     assert isinstance(img, MCPImage)
     assert img.data.startswith(b"\x89PNG")
     # Counts surface in the summary
