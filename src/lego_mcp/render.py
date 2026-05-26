@@ -26,6 +26,22 @@ STUD_RADIUS = 6.0      # LDU (real LEGO stud is 6 LDU radius)
 STUD_HEIGHT = 4.0      # LDU
 STUD_CIRCLE_SIDES = 12
 MAX_STUDS_PER_PART = 256  # skip on baseplate-size parts to keep render fast
+FACE_COVER_TOL = 0.5
+
+DEBUG_PALETTE: tuple[tuple[int, int, int], ...] = (
+    (226, 74, 51),
+    (42, 130, 218),
+    (52, 168, 83),
+    (245, 178, 47),
+    (146, 94, 190),
+    (41, 171, 166),
+    (238, 112, 162),
+    (128, 142, 49),
+    (235, 126, 49),
+    (77, 109, 186),
+    (162, 82, 68),
+    (89, 161, 113),
+)
 
 
 def _project(x: float, y: float, z: float) -> tuple[float, float]:
@@ -40,6 +56,69 @@ def _project(x: float, y: float, z: float) -> tuple[float, float]:
 
 def _shade(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return tuple(max(0, min(255, int(c * factor))) for c in rgb)  # type: ignore[return-value]
+
+
+def _debug_rgb(inst: "PartInstance", ordinal: int, mode: str,
+               model_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Return the display color for normal/debug render modes."""
+    key = mode.strip().lower()
+    if inst.part_id in {"3811", "3857"}:
+        return model_rgb
+    if key in ("model", "actual", "part"):
+        return model_rgb
+    if key in ("debug", "instance", "piece", "pieces"):
+        return DEBUG_PALETTE[ordinal % len(DEBUG_PALETTE)]
+    if key in ("row", "course", "courses"):
+        row = int(round((-(inst.y + 4)) / 24))
+        return DEBUG_PALETTE[row % len(DEBUG_PALETTE)]
+    if key in ("rotation", "axis"):
+        idx = {
+            "identity": 0,
+            "rot90y": 1,
+            "rot180y": 2,
+            "rot270y": 3,
+            "rot90x": 4,
+            "rot90z": 5,
+        }.get(inst.rotation, ordinal)
+        return DEBUG_PALETTE[idx % len(DEBUG_PALETTE)]
+    raise ValueError("color_mode must be model, instance, row, or rotation")
+
+
+def _covers_interval(cover_min: float, cover_max: float,
+                     target_min: float, target_max: float) -> bool:
+    return cover_min <= target_min + FACE_COVER_TOL and cover_max >= target_max - FACE_COVER_TOL
+
+
+def _face_is_fully_covered(face: str, aabb: tuple, all_aabbs: list[tuple]) -> bool:
+    """Cull faces that are exactly hidden by a touching neighboring AABB.
+
+    The renderer only draws the three faces visible from the fixed camera:
+    top (-Y), east (+X), and south/front (+Z). If another part shares and
+    fully covers one of those planes, drawing that face creates impossible
+    internal edges. This is intentionally conservative: partial coverage is
+    left to the painter pass so we don't accidentally erase visible surfaces.
+    """
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
+    for other in all_aabbs:
+        if other is aabb:
+            continue
+        (oxmin, oymin, ozmin), (oxmax, oymax, ozmax) = other
+        if face == "top":
+            if (abs(oymax - ymin) <= FACE_COVER_TOL
+                    and _covers_interval(oxmin, oxmax, xmin, xmax)
+                    and _covers_interval(ozmin, ozmax, zmin, zmax)):
+                return True
+        elif face == "east":
+            if (abs(oxmin - xmax) <= FACE_COVER_TOL
+                    and _covers_interval(oymin, oymax, ymin, ymax)
+                    and _covers_interval(ozmin, ozmax, zmin, zmax)):
+                return True
+        elif face == "south":
+            if (abs(ozmin - zmax) <= FACE_COVER_TOL
+                    and _covers_interval(oxmin, oxmax, xmin, xmax)
+                    and _covers_interval(oymin, oymax, ymin, ymax)):
+                return True
+    return False
 
 
 def _stud_positions_local(part) -> list[tuple[float, float, float]]:
@@ -106,6 +185,8 @@ def render_model_png(
     height: int = 600,
     background: tuple[int, int, int] = (245, 245, 248),
     margin: int = 40,
+    color_mode: str = "model",
+    hidden_edges: bool = True,
 ) -> bytes:
     """Render the model and return PNG bytes."""
     from lego_mcp.parts import color_rgb
@@ -120,7 +201,7 @@ def render_model_png(
         img.save(buf, "PNG")
         return buf.getvalue()
 
-    # Build a list of (depth, screen_corners, fill_rgb, outline) per visible face.
+    # Build draw commands for visible face fills plus edge overlays.
     # Painter's algorithm works face-by-face, but a single large face (like a
     # baseplate top) has its centroid far from where small parts sit on top, so
     # naive sorting fails. We subdivide large faces into ~2-stud chunks so the
@@ -128,14 +209,17 @@ def render_model_png(
     # scale will want a real z-buffer or BSP. (See NOTES.md.)
     # Camera at (+X, -Y, +Z) -> "closeness" = X - Y + Z. Bigger = closer.
     SUBDIV = 20.0  # LDU; one stud per chunk so studs sort correctly within their own brick.
-    Face = tuple[float, list[tuple[float, float]], tuple[int, int, int], tuple[int, int, int] | None]
-    faces: list[Face] = []
+    Fill = tuple[float, list[tuple[float, float]], tuple[int, int, int]]
+    Edge = tuple[float, list[tuple[float, float]], tuple[int, int, int], str]
+    faces: list[Fill] = []
+    outlines: list[Edge] = []
+    hidden_outlines: list[Edge] = []
     all_proj: list[tuple[float, float]] = []
 
     def _emit_face(corners3d: list[tuple[float, float, float]], fill: tuple[int, int, int]) -> None:
         closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
         screen = [_project(*c) for c in corners3d]
-        faces.append((closeness, screen, fill, None))
+        faces.append((closeness, screen, fill))
         all_proj.extend(screen)
 
     def _split_rect(p0: tuple[float, float, float], du: tuple[float, float, float],
@@ -157,44 +241,64 @@ def render_model_png(
 
     from lego_mcp.server import matrix_apply, resolve_rotation
 
-    # Outlines are emitted as separate "outline polygons" with no fill, at the
-    # face's centroid depth. They sort with the sub-fills in the painter loop,
-    # so faces in front correctly cover the outlines of parts behind them.
-    outlines: list[tuple[float, list[tuple[float, float]], tuple[int, int, int]]] = []
     OUTLINE_RGB = (40, 40, 40)
+    HIDDEN_RGB = (80, 80, 80)
 
-    def _emit_outline(corners3d: list[tuple[float, float, float]]) -> None:
+    def _emit_edge(corners3d: list[tuple[float, float, float]], style: str = "solid") -> None:
         closeness = sum(cx - cy + cz for (cx, cy, cz) in corners3d) / len(corners3d)
         screen = [_project(*c) for c in corners3d]
-        outlines.append((closeness, screen, OUTLINE_RGB))
+        target = hidden_outlines if style == "dotted" else outlines
+        color = HIDDEN_RGB if style == "dotted" else OUTLINE_RGB
+        target.append((closeness, screen, color, style))
         all_proj.extend(screen)
 
-    for inst in parts.values():
+    part_records = []
+    for ordinal, inst in enumerate(parts.values()):
         part = index.get(inst.part_id)
         if part is None:
             continue
-        (xmin, ymin, zmin), (xmax, ymax, zmax) = part_aabb_world(inst, part)
-        rgb = color_rgb(inst.color)
+        aabb = part_aabb_world(inst, part)
+        part_records.append((ordinal, inst, part, aabb))
+    all_aabbs = [aabb for _ordinal, _inst, _part, aabb in part_records]
+
+    for ordinal, inst, part, aabb in part_records:
+        (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
+        rgb = _debug_rgb(inst, ordinal, color_mode, color_rgb(inst.color))
         w, h, d = (xmax - xmin), (ymax - ymin), (zmax - zmin)
+        top_covers = _face_is_fully_covered("top", aabb, all_aabbs)
+        east_covers = _face_is_fully_covered("east", aabb, all_aabbs)
+        south_covers = _face_is_fully_covered("south", aabb, all_aabbs)
 
-        # Subdivide each visible face into ~2-stud chunks so painter's depth
-        # sorting resolves stacking correctly.
-        _split_rect(p0=(xmin, ymin, zmin), du=(w, 0, 0), dv=(0, 0, d),
-                    length_u=w, length_v=d, fill=_shade(rgb, 1.10))   # top
-        _split_rect(p0=(xmax, ymin, zmin), du=(0, h, 0), dv=(0, 0, d),
-                    length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # right
-        _split_rect(p0=(xmin, ymin, zmax), du=(w, 0, 0), dv=(0, h, 0),
-                    length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # front
+        top = [(xmin, ymin, zmin), (xmax, ymin, zmin),
+               (xmax, ymin, zmax), (xmin, ymin, zmax)]
+        east = [(xmax, ymin, zmin), (xmax, ymin, zmax),
+                (xmax, ymax, zmax), (xmax, ymax, zmin)]
+        south = [(xmin, ymin, zmax), (xmax, ymin, zmax),
+                 (xmax, ymax, zmax), (xmin, ymax, zmax)]
 
-        # Per-face perimeter outlines at face centroid depth (occlusion-correct
-        # within a single brick; may slightly bleed when two bricks of similar
-        # depth overlap — acceptable for the debug-aid use case).
-        _emit_outline([(xmin, ymin, zmin), (xmax, ymin, zmin),
-                       (xmax, ymin, zmax), (xmin, ymin, zmax)])  # top
-        _emit_outline([(xmax, ymin, zmin), (xmax, ymin, zmax),
-                       (xmax, ymax, zmax), (xmax, ymax, zmin)])  # right
-        _emit_outline([(xmin, ymin, zmax), (xmax, ymin, zmax),
-                       (xmax, ymax, zmax), (xmin, ymax, zmax)])  # front
+        if top_covers:
+            if hidden_edges:
+                _emit_edge(top, "dotted")
+        else:
+            _split_rect(p0=(xmin, ymin, zmin), du=(w, 0, 0), dv=(0, 0, d),
+                        length_u=w, length_v=d, fill=_shade(rgb, 1.10))   # top
+            _emit_edge(top)
+
+        if east_covers:
+            if hidden_edges:
+                _emit_edge(east, "dotted")
+        else:
+            _split_rect(p0=(xmax, ymin, zmin), du=(0, h, 0), dv=(0, 0, d),
+                        length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # east/right
+            _emit_edge(east)
+
+        if south_covers:
+            if hidden_edges:
+                _emit_edge(south, "dotted")
+        else:
+            _split_rect(p0=(xmin, ymin, zmax), du=(w, 0, 0), dv=(0, h, 0),
+                        length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # south/front
+            _emit_edge(south)
 
         # Studs on top, if applicable. Each stud is a small disc at the top of
         # a 4-LDU-tall cylinder. We project the disc as a polygon and feed it
@@ -202,11 +306,12 @@ def render_model_png(
         rot = resolve_rotation(inst.rotation)
         # Studs slightly brighter than the top face so they read as raised.
         stud_fill = _shade(rgb, 1.25)
-        for sx_local, sy_local, sz_local in _stud_positions_local(part):
-            wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
-            world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
-            disc = _stud_disc_corners(*world_center)
-            _emit_face(disc, stud_fill)
+        if not top_covers:
+            for sx_local, sy_local, sz_local in _stud_positions_local(part):
+                wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
+                world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
+                disc = _stud_disc_corners(*world_center)
+                _emit_face(disc, stud_fill)
 
     if not all_proj:
         buf = io.BytesIO()
@@ -222,22 +327,56 @@ def render_model_png(
     off_x = margin - min(pxs) * scale + (width - 2 * margin - src_w * scale) / 2
     off_y = margin - min(pys) * scale + (height - 2 * margin - src_h * scale) / 2
 
+    def _screen_poly(screen: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        return [(sx * scale + off_x, sy * scale + off_y) for sx, sy in screen]
+
+    def _draw_dotted_line(p0: tuple[float, float], p1: tuple[float, float],
+                          color: tuple[int, int, int], width_px: int = 1) -> None:
+        x0, y0 = p0
+        x1, y1 = p1
+        dx, dy = x1 - x0, y1 - y0
+        dist = math.hypot(dx, dy)
+        if dist <= 0:
+            return
+        dash, gap = 4.0, 4.0
+        cursor = 0.0
+        while cursor < dist:
+            end = min(cursor + dash, dist)
+            a = cursor / dist
+            b = end / dist
+            draw.line(
+                [(x0 + dx * a, y0 + dy * a), (x0 + dx * b, y0 + dy * b)],
+                fill=color,
+                width=width_px,
+            )
+            cursor += dash + gap
+
+    def _draw_dotted_poly(poly: list[tuple[float, float]],
+                          color: tuple[int, int, int]) -> None:
+        for i, p0 in enumerate(poly):
+            _draw_dotted_line(p0, poly[(i + 1) % len(poly)], color)
+
     # Merge sub-fills + outlines by depth and draw farthest-first.
     # Sub-fills are tagged with fill_only=True (no outline stroke); outlines
     # are stroke-only (no fill).
-    merged: list[tuple[float, list[tuple[float, float]], tuple[int, int, int], bool]] = []
-    for closeness, screen, fill, _ in faces:
-        merged.append((closeness, screen, fill, True))    # True = fill
-    for closeness, screen, outline_rgb in outlines:
-        merged.append((closeness, screen, outline_rgb, False))  # False = stroke
+    merged: list[tuple[float, list[tuple[float, float]], tuple[int, int, int], str]] = []
+    for closeness, screen, fill in faces:
+        merged.append((closeness, screen, fill, "fill"))
+    for closeness, screen, outline_rgb, style in outlines:
+        merged.append((closeness, screen, outline_rgb, style))
     merged.sort(key=lambda f: f[0])
-    for _, screen, color, is_fill in merged:
-        poly = [(sx * scale + off_x, sy * scale + off_y) for sx, sy in screen]
-        if is_fill:
+    for _, screen, color, style in merged:
+        poly = _screen_poly(screen)
+        if style == "fill":
             draw.polygon(poly, fill=color, outline=color)
         else:
-            # Stroke only — close the polygon explicitly.
             draw.line(poly + [poly[0]], fill=color, width=1)
+
+    # Hidden/internal contact planes are intentionally drawn last as dotted
+    # guide lines. They are not visible surfaces; drawing them last makes that
+    # structural information available without pretending it is an outside edge.
+    for _closeness, screen, color, _style in hidden_outlines:
+        _draw_dotted_poly(_screen_poly(screen), color)
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)

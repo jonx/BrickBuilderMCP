@@ -70,6 +70,8 @@ def test_server_initializes_and_calls_tool():
             "undo", "redo",
             "save_checkpoint", "restore_checkpoint",
             "render_model",  # only registers if Pillow is importable
+            "build_wall", "build_perimeter", "build_room",
+            "analyze_assembly_ports", "find_subassembly_connections", "move_subassembly",
         ]:
             assert required in names, f"tool {required!r} not exposed; got {names}"
 

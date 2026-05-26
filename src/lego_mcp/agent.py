@@ -41,8 +41,9 @@ Workflow:
 - Start with create_model(name).
 - Use search_parts(query) to find pieces by description.
 - Place a baseplate (3811 = 32x32, top face at y=-4) before building.
-- For walls: use build_wall(x0,z0,x1,z1, height_rows, color, bond,
-   inset_ends, base_y=-4). For rectangles of walls: build_room.
+- For straight walls: use build_wall(x0,z0,x1,z1, height_rows, color, bond,
+   inset_ends, base_y=-4). For closed rectilinear outlines from plans/images:
+   build_perimeter(points=[...]). For simple rectangles: build_room.
 - For floors: build_floor.
 - After ~20 placements: validate_model(). If collisions/floating/unanchored
    appear, fix BEFORE continuing. render_model() to see what you built.

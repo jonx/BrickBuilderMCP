@@ -197,6 +197,27 @@ def _internal_seams(endpoints: set[int]) -> set[int]:
     return set(sorted_eps[1:-1])
 
 
+def _run_axis_and_endpoints(inst) -> tuple[str, int, int] | None:
+    """Return the horizontal run axis and world endpoints for a rectangular brick.
+
+    Rotation changes whether a 1x4/2x4 contributes seams along X or Z. Square
+    parts are ambiguous, so we skip them for seam scoring; they are usually
+    fillers or corner pieces and otherwise add more noise than signal.
+    """
+    from lego_mcp.server import PART_INDEX, part_aabb_world
+    part = PART_INDEX.get(inst.part_id)
+    if part is None:
+        return None
+    (xmin, _ymin, zmin), (xmax, _ymax, zmax) = part_aabb_world(inst, part)
+    x_len = xmax - xmin
+    z_len = zmax - zmin
+    if abs(x_len - z_len) < 0.5:
+        return None
+    if x_len > z_len:
+        return ("x", int(round(xmin)), int(round(xmax)))
+    return ("z", int(round(zmin)), int(round(zmax)))
+
+
 def vertical_seam_score(parts, subassembly: str | None = None) -> int:
     """Count adjacent-row pairs that share an INTERNAL seam X position (a
     continuous vertical seam between bricks). Lower is better; 0 = perfect stagger.
@@ -204,23 +225,17 @@ def vertical_seam_score(parts, subassembly: str | None = None) -> int:
     Wall-end positions (the row's min / max) are not counted — they're the
     wall boundary, not a between-brick seam.
     """
-    from lego_mcp.connectors import definition_for
     rows: dict[int, dict[str, set[int]]] = defaultdict(lambda: {"x": set(), "z": set()})
     for inst in parts.values():
         if subassembly is not None and inst.subassembly != subassembly:
             continue
-        defn = definition_for(inst.part_id)
-        if defn is None:
+        run = _run_axis_and_endpoints(inst)
+        if run is None:
             continue
+        axis, start, end = run
         row = _row_of(inst)
-        if defn.width_studs >= defn.depth_studs:
-            half = defn.width_ldu / 2
-            rows[row]["x"].add(int(round(inst.x - half)))
-            rows[row]["x"].add(int(round(inst.x + half)))
-        else:
-            half = defn.depth_ldu / 2
-            rows[row]["z"].add(int(round(inst.z - half)))
-            rows[row]["z"].add(int(round(inst.z + half)))
+        rows[row][axis].add(start)
+        rows[row][axis].add(end)
     sorted_rows = sorted(rows.keys())
     score = 0
     for i in range(len(sorted_rows) - 1):
@@ -236,24 +251,22 @@ def vertical_seam_score(parts, subassembly: str | None = None) -> int:
 def wall_bond_quality(parts, subassembly: str | None = None) -> float:
     """0..1 score: 1.0 means every adjacent-row pair has its seams fully shifted
     away from the row below. Computed as 1 - (shared seams / total seam slots)."""
-    from lego_mcp.connectors import definition_for
     rows_x: dict[int, set[int]] = defaultdict(set)
     rows_z: dict[int, set[int]] = defaultdict(set)
     for inst in parts.values():
         if subassembly is not None and inst.subassembly != subassembly:
             continue
-        defn = definition_for(inst.part_id)
-        if defn is None:
+        run = _run_axis_and_endpoints(inst)
+        if run is None:
             continue
+        axis, start, end = run
         row = _row_of(inst)
-        if defn.width_studs >= defn.depth_studs:
-            half = defn.width_ldu / 2
-            rows_x[row].add(int(round(inst.x - half)))
-            rows_x[row].add(int(round(inst.x + half)))
+        if axis == "x":
+            rows_x[row].add(start)
+            rows_x[row].add(end)
         else:
-            half = defn.depth_ldu / 2
-            rows_z[row].add(int(round(inst.z - half)))
-            rows_z[row].add(int(round(inst.z + half)))
+            rows_z[row].add(start)
+            rows_z[row].add(end)
     shared = 0
     total = 0
     for rows in (rows_x, rows_z):

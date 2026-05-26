@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from lego_mcp import server
 from lego_mcp import helpers
-from lego_mcp.connection_graph import vertical_seam_score, wall_bond_quality
+from lego_mcp.connection_graph import build_graph, vertical_seam_score, wall_bond_quality
 
 
 def _seam_xs_per_row(parts, axis: str = "x") -> dict[int, set[int]]:
@@ -46,35 +46,134 @@ def test_straight_wall_validates_no_floating_no_collision():
     assert v["summary"]["floating"] == 0
 
 
-def test_room_corner_bricks_stack_aligned():
-    """Each SW corner brick's XZ must match the row above/below (it's a
-    vertical column of 2x2s — they must align)."""
+def test_room_corner_courses_alternate_ownership():
+    """Rows alternate which wall direction owns each corner."""
+    server.create_model()
+    server.add_part("3811", "tan", 0, 0, 0)
+    r = helpers.build_room(-80, -60, 80, 60, height_rows=4,
+                            color="red", base_y=-4)
+    assert r["ok"]
+    assert r["wall_thickness_studs"] == 2
+    row0 = r["rows"][0]["segments"]
+    row1 = r["rows"][1]["segments"]
+    assert [s["axis"] for s in row0] == ["x", "z", "x", "z"]
+    assert [s["axis"] for s in row1] == ["x", "z", "x", "z"]
+    assert [s["owns_corner"] for s in row0] == [True, False, True, False]
+    assert [s["owns_corner"] for s in row1] == [False, True, False, True]
+    # The owning edge spans the full outside dimension; the other direction is inset.
+    assert row0[0]["length"] == 160
+    assert row1[0]["length"] == 80
+    assert row0[1]["length"] == 40
+    assert row1[1]["length"] == 120
+
+
+def test_room_corner_is_bonded_between_rows():
+    """The row above bridges over the previous row's corner seam."""
     server.create_model()
     server.add_part("3811", "tan", 0, 0, 0)
     helpers.build_room(-80, -60, 80, 60, height_rows=4,
                         color="red", base_y=-4)
-    sw_bricks = sorted(
-        (p for p in server.STATE.parts.values()
-         if p.part_id == "3003" and p.x < 0 and p.z < 0),
-        key=lambda p: p.y, reverse=True   # bottom to top (y=-4 first)
+    graph, _edges = build_graph(server.STATE.parts)
+    row0_corner = next(
+        p for p in server.STATE.parts.values()
+        if p.y == -4 and p.rotation == "identity" and abs(p.x + 40) < 0.5 and abs(p.z + 40) < 0.5
     )
-    assert len(sw_bricks) == 4
-    xs = {p.x for p in sw_bricks}
-    zs = {p.z for p in sw_bricks}
-    assert len(xs) == 1 and len(zs) == 1   # perfectly stacked column
+    row1_corner = next(
+        p for p in server.STATE.parts.values()
+        if p.y == -28 and p.rotation == "rot90y" and abs(p.x + 60) < 0.5 and abs(p.z + 20) < 0.5
+    )
+    assert row1_corner.instance_id in graph[row0_corner.instance_id]
 
 
-def test_room_corner_columns_connect_vertically():
-    """The room uses 2x2 (3003) corner bricks. Adjacent-row corner bricks must
-    share at least one stud (4 actually, since 2x2 is fully symmetric)."""
+def test_room_validates_as_connected_structure():
     server.create_model()
     server.add_part("3811", "tan", 0, 0, 0)
     helpers.build_room(-80, -60, 80, 60, height_rows=4,
                         color="red", base_y=-4)
-    # Find all 3003 bricks at the SW corner
-    sw = [p for p in server.STATE.parts.values()
-          if p.part_id == "3003" and p.x < 0 and p.z < 0]
-    assert len(sw) == 4   # one per row
+    v = server.validate_model()
+    assert v["summary"]["collisions"] == 0
+    assert v["summary"]["floating"] == 0
+    assert v["summary"]["unanchored"] == 0
+
+
+def test_room_can_be_built_with_only_2x4_bricks_when_dimensions_fit():
+    server.create_model()
+    server.add_part("3811", "tan", 0, 0, 0)
+    r = helpers.build_room(-160, -120, 160, 120, height_rows=4,
+                            color="red", base_y=-4, palette=["3001"])
+    assert r["ok"]
+    part_ids = {p.part_id for p in server.STATE.parts.values()}
+    assert part_ids == {"3811", "3001"}
+    v = server.validate_model()
+    assert v["summary"]["collisions"] == 0
+    assert v["summary"]["floating"] == 0
+    assert v["summary"]["unanchored"] == 0
+    assert v["summary"]["vertical_seam_score"] == 0
+    assert v["summary"]["wall_bond_quality"] == 1.0
+
+
+def test_room_2x4_only_rejects_dimensions_that_need_fillers():
+    server.create_model()
+    server.add_part("3811", "tan", 0, 0, 0)
+    try:
+        helpers.build_room(-80, -60, 80, 60, height_rows=2,
+                            color="red", base_y=-4, palette=["3001"])
+    except ValueError as exc:
+        assert "no brick fit" in str(exc)
+    else:
+        raise AssertionError("expected 2x4-only room to reject non-4-stud segment lengths")
+
+
+def test_build_perimeter_supports_l_shaped_outline():
+    server.create_model()
+    server.add_part("3811", "tan", 0, 0, 0)
+    r = helpers.build_perimeter(
+        [[-240, -160], [240, -160], [240, 0], [80, 0], [80, 160], [-240, 160]],
+        height_rows=4,
+        color="red",
+        base_y=-4,
+    )
+    assert r["ok"]
+    assert len(r["points"]) == 6
+    part_ids = {p.part_id for p in server.STATE.parts.values()}
+    assert part_ids <= {"3811", "3001", "3002", "3003"}
+    v = server.validate_model()
+    assert v["summary"]["collisions"] == 0
+    assert v["summary"]["floating"] == 0
+    assert v["summary"]["unanchored"] == 0
+
+
+def test_build_perimeter_bonds_concave_corners_between_rows():
+    server.create_model()
+    server.add_part("3811", "tan", 0, 0, 0)
+    helpers.build_perimeter(
+        [[-240, -160], [240, -160], [240, 0], [80, 0], [80, 160], [-240, 160]],
+        height_rows=2,
+        color="red",
+        base_y=-4,
+    )
+    graph, _edges = build_graph(server.STATE.parts)
+    row0_bridge = next(
+        p for p in server.STATE.parts.values()
+        if p.y == -4 and p.rotation == "identity"
+        and abs(p.x - 80) < 0.5 and abs(p.z + 20) < 0.5
+    )
+    row1_bridge = next(
+        p for p in server.STATE.parts.values()
+        if p.y == -28 and p.rotation == "rot90y"
+        and abs(p.x - 60) < 0.5 and abs(p.z) < 0.5
+    )
+    assert row1_bridge.instance_id in graph[row0_bridge.instance_id]
+
+
+def test_build_perimeter_rejects_diagonal_edges():
+    server.create_model()
+    try:
+        helpers.build_perimeter([[0, 0], [80, 40], [80, 120], [0, 120]])
+    except ValueError as exc:
+        assert "diagonal" in str(exc)
+    else:
+        raise AssertionError("expected diagonal perimeter edge to be rejected")
 
 
 def test_seam_score_is_low_for_staggered_wall():

@@ -30,18 +30,20 @@ WORKFLOW_BLURB = """\
 1. `add_part` / helpers like `build_wall`.
 2. `validate_model` — fix any collisions/unknowns the report flags.
 3. `render_model` — look at the result; check proportions, alignment, colors.
+   Use `render_model(color_mode="instance")` or `"row"` when debugging brick layout.
 4. If wrong: `undo` or `restore_checkpoint`. If right: `save_checkpoint` and continue.
 
 For models above ~100 parts, decompose into **subassemblies**:
-- `create_subassembly("left_tower")`, switch to it, build it.
-- Then `place_subassembly("left_tower", parent="main", x=-200, ...)` to stamp it into the model.
-- Use `mirror_subassembly` for bilateral symmetry (e.g. cathedral facades).
+- `set_current_subassembly("left_tower")`, build that component, then switch back to `main`.
+- Use `clone_subassembly(src, dst, x_offset, y_offset, z_offset)` to repeat a component.
+- Use `mirror_subassembly(src, dst, axis, plane_offset)` for bilateral symmetry (e.g. cathedral facades).
 """
 
 TECHNIQUES_BLURB = """\
 **Well-known LEGO techniques you should use, not reinvent**:
 
 - **Running bond (stretcher)**: each brick row offset by half a brick from the row below — distributes load, looks like real masonry. Use `build_wall(..., bond="running")`.
+- **Bonded rectilinear perimeters**: use `build_perimeter(points=[...])` for footprints from images/plans/models. Use `build_room(...)` only as the rectangle shortcut. Corners alternate direction by row; use `palette=["3001"]` when you specifically want 2x4-only walls and the dimensions fit.
 - **English bond**: alternating header (short side facing out) and stretcher rows. Use for thick, sturdy walls.
 - **Plates instead of bricks**: 3 plates = 1 brick height. Use plates where you need fine height control or where the model will be picked up (plates lock).
 - **Tiles for smooth tops**: when a surface should look finished (floors, roofs, road).
@@ -49,6 +51,7 @@ TECHNIQUES_BLURB = """\
 - **SNOT (Studs Not On Top)**: use brackets (parts like 99206, 30179) to attach bricks sideways. Essential for textured walls and any non-rectangular surface.
 - **MILS baseplate modules**: 64-stud (8x8) modular units for landscaping.
 - **Reference / mirror**: build one half, then `mirror_subassembly`. Cathedrals, castles, vehicles often have symmetry.
+- **Assembly ports**: after building a module, use `analyze_assembly_ports(subassembly)` to see exposed studs/receivers, and `find_subassembly_connections(movable, target)` before moving or cloning large modules.
 - **Color coding subassemblies**: use vivid colors during the build to keep mechanisms visually distinct, then re-color before final render.
 """
 
@@ -206,7 +209,11 @@ Here are well-known LEGO building techniques relevant to this toolchain. Apply t
 
 You also have these LegoMCP helpers (call them by name with no arguments to see signatures):
 - `build_wall(x0, z0, x1, z1, height, color, bond)`
+- `build_perimeter(points, height_rows, color, thickness_studs, palette)`
 - `build_floor(x_min, z_min, x_max, z_max, y, color, part)`
-- `mirror_subassembly(name, axis)`
-- `repeat_subassembly(name, offsets)`
+- `build_room(x_min, z_min, x_max, z_max, height_rows, color)`
+- `clone_subassembly(src, dst, x_offset, y_offset, z_offset)`
+- `mirror_subassembly(src, dst, axis, plane_offset)`
+- `analyze_assembly_ports(subassembly)`
+- `find_subassembly_connections(movable, target)`
 """)]

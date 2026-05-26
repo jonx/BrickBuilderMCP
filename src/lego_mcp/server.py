@@ -764,6 +764,84 @@ def mirror_subassembly(src: str, dst: str, axis: str = "x",
     return {"ok": True, "src": src, "dst": dst, "axis": axis_lower, "parts": mirrored}
 
 
+def _parts_for_subassembly(name: str | None) -> dict[str, PartInstance]:
+    """Return a part dict filtered by subassembly. None means all parts."""
+    if name is None or name == "":
+        return dict(STATE.parts)
+    selected = {iid: p for iid, p in STATE.parts.items() if p.subassembly == name}
+    if not selected:
+        raise ValueError(f"subassembly {name!r} has no parts")
+    return selected
+
+
+@mcp.tool()
+def move_subassembly(name: str, dx: float = 0, dy: float = 0, dz: float = 0) -> dict[str, Any]:
+    """Move every part tagged with `name` by an offset. Undoable per part.
+
+    Useful after `find_subassembly_connections` suggests an offset for joining
+    one rigid module to another.
+    """
+    selected = _parts_for_subassembly(name)
+    moved = 0
+    for inst in selected.values():
+        old_pos = (inst.x, inst.y, inst.z)
+        new_pos = (inst.x + dx, inst.y + dy, inst.z + dz)
+        inst.x, inst.y, inst.z = new_pos
+        _record(Op("move", inst.instance_id, {"old_pos": old_pos, "new_pos": new_pos}))
+        moved += 1
+    return {"ok": True, "subassembly": name, "moved": moved,
+            "offset": [dx, dy, dz]}
+
+
+@mcp.tool()
+def analyze_assembly_ports(subassembly: str | None = None,
+                           max_connectors: int = 200,
+                           max_ports: int = 50) -> dict[str, Any]:
+    """List exposed studs/receivers and clustered attachment ports.
+
+    Args:
+        subassembly: Optional subassembly name. Omit for the whole model.
+        max_connectors: Cap detailed connector rows; counts still include all.
+        max_ports: Cap returned port clusters; largest ports are returned first.
+    """
+    from lego_mcp.assembly_ports import analyze_ports
+    selected = _parts_for_subassembly(subassembly)
+    result = analyze_ports(selected, max_connectors=max_connectors, max_ports=max_ports)
+    result["subassembly"] = subassembly
+    return result
+
+
+@mcp.tool()
+def find_subassembly_connections(movable: str,
+                                 target: str | None = None,
+                                 limit: int = 20) -> dict[str, Any]:
+    """Find offsets that would connect one subassembly to another assembly.
+
+    Args:
+        movable: The subassembly you intend to move.
+        target: Target subassembly. Omit to use every part not in `movable`.
+        limit: Number of candidate offsets to return, sorted by matched studs.
+    """
+    from lego_mcp.assembly_ports import connection_offsets
+    movable_parts = _parts_for_subassembly(movable)
+    if target:
+        target_parts = _parts_for_subassembly(target)
+    else:
+        target_parts = {
+            iid: p for iid, p in STATE.parts.items()
+            if p.subassembly != movable
+        }
+        if not target_parts:
+            raise ValueError("target omitted but no other parts are available")
+    candidates = connection_offsets(movable_parts, target_parts, limit=limit)
+    return {
+        "movable": movable,
+        "target": target,
+        "candidates": candidates,
+        "count": len(candidates),
+    }
+
+
 CELL_SIZE = 80.0  # LDU. Picked to roughly match a 2x4 brick footprint.
 
 
@@ -1111,12 +1189,21 @@ try:
     from lego_mcp.render import render_model_png  # noqa: F401
 
     @mcp.tool()
-    def render_model(width: int = 800, height: int = 600) -> dict[str, Any]:
+    def render_model(width: int = 800, height: int = 600,
+                     color_mode: str = "model",
+                     hidden_edges: bool = True) -> dict[str, Any]:
         """Render the model as an isometric PNG.
 
         Writes to ./renders/<timestamp>_<model>.png so the history is preserved —
         come back later and scroll the renders folder to see how the model evolved.
         Also updates ./renders/latest.png as a convenience pointer.
+
+        Args:
+            color_mode: "model" uses actual part colors. "instance" assigns a
+                different color to each piece. "row" colors each brick course.
+                "rotation" colors by orientation.
+            hidden_edges: draw fully covered/internal contact faces as dotted
+                guide lines; exposed outside edges remain solid.
         """
         from datetime import datetime
 
@@ -1125,12 +1212,14 @@ try:
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in STATE.name) or "model"
         out = renders_dir / f"{stamp}_{safe_name}.png"
-        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height)
+        png = render_model_png(STATE.parts, PART_INDEX, width=width, height=height,
+                               color_mode=color_mode, hidden_edges=hidden_edges)
         out.write_bytes(png)
         # Convenience latest pointer (real file, not symlink — works on all filesystems).
         (renders_dir / "latest.png").write_bytes(png)
         return {"ok": True, "path": str(out), "latest": str(renders_dir / "latest.png"),
-                "parts": len(STATE.parts), "width": width, "height": height}
+                "parts": len(STATE.parts), "width": width, "height": height,
+                "color_mode": color_mode, "hidden_edges": hidden_edges}
 except ImportError:
     log.info("Pillow not available; render_model tool disabled.")
 

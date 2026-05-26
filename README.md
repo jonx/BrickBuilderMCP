@@ -61,7 +61,7 @@ You'll find PNG renders in `./renders/<timestamp>.png` (history preserved; `late
 | `get_part_info(part_id)` | Dimensions, stud positions, AABB |
 | `list_colors()` | The ~22 named colors with LDraw IDs |
 | `validate_model()` | Reports collisions, unknown parts, floating, unanchored islands |
-| `render_model(width, height)` | Built-in isometric PNG to `./renders/<timestamp>.png` |
+| `render_model(width, height, color_mode, hidden_edges)` | Built-in isometric PNG to `./renders/<timestamp>.png`. `color_mode` can be `model`, `instance`, `row`, or `rotation`; hidden/internal edges render dotted while exposed edges stay solid. |
 | `export_ldr(path)` / `export_mpd(path)` / `import_ldr(path)` | LDraw I/O |
 | `undo()` / `redo()` | O(1) operation-based |
 | `save_checkpoint(name)` / `restore_checkpoint(name)` / `list_checkpoints()` | Named in-memory snapshots |
@@ -74,12 +74,16 @@ You'll find PNG renders in `./renders/<timestamp>.png` (history preserved; `late
 | `remove_subassembly(name)` | Delete every part with the tag |
 | `clone_subassembly(src, dst, x_offset, y_offset, z_offset)` | Duplicate a built component to a new location |
 | `mirror_subassembly(src, dst, axis, plane_offset)` | Bilateral symmetry — build half a cathedral, mirror it |
+| `move_subassembly(name, dx, dy, dz)` | Move a rigid tagged module, undoable per part |
+| `analyze_assembly_ports(subassembly)` | Cluster exposed studs/receivers into usable attachment ports for a whole module |
+| `find_subassembly_connections(movable, target)` | Suggest offsets that align exposed ports between modules |
 
 ### High-level building helpers
 | Tool | What it does |
 |---|---|
 | `build_wall(x0, z0, x1, z1, height_rows, color, bond, brick_part, base_y, inset_ends)` | A straight wall with `stretcher` or `running` bond. Each running-bond row is offset by half a brick — real masonry. |
-| `build_room(x_min, z_min, x_max, z_max, height_rows, color, bond, base_y)` | 4 walls + 2x2 corner columns. *Limitation: corner columns sit next to walls; for fully-bonded corners, place pieces manually with alternating rotation per row.* |
+| `build_perimeter(points, height_rows, color, base_y, thickness_studs, palette)` | Generic bonded rectilinear wall outline from outer-corner points. This is the footprint compiler for plans/images/models; `build_room` is a rectangle wrapper around it. |
+| `build_room(x_min, z_min, x_max, z_max, height_rows, color, base_y, palette)` | A 2-stud-thick rectangular perimeter with bonded corners. Courses alternate which wall direction owns each corner, so the next row bridges the seam below. Use `palette=["3001"]` to force 2x4-only walls when dimensions fit. |
 | `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` | Tile a rectangle with plates |
 | `repeat_pattern(part_id, count, dx, dy, dz, ...)` | Array of identical parts |
 
@@ -144,7 +148,7 @@ Architecture and decisions in [NOTES.md](NOTES.md).
 
 - **No physics simulation.** A connected structure that would topple is reported as valid.
 - **No stud-clutch geometry.** Connection is approximated by axis-aligned XZ overlap, not by per-stud mating. False negatives can happen with rotated parts or 1x1 corner contacts.
-- **build_room's corners aren't bonded.** Real LEGO masonry alternates which wall extends into the corner per row. The helper produces touching-not-bonded corner columns; cathedral-corners need manual placement (with `set_current_subassembly` you can build half manually and mirror).
+- **General wall outlines are a first pass.** `build_perimeter(points=...)` handles closed orthogonal footprints. Openings, diagonal/curved walls, roofs, and organic surfaces still need richer volume compilation.
 - **Generic helpers don't know about half-stud / jumper-plate offsets.** Vertical 8-LDU plate offsets work; horizontal half-stud needs manual placement.
 - **No photoreal renderer.** Built-in is isometric AABB-with-studs; for pretty renders, open the exported MPD in BrickLink Studio.
 

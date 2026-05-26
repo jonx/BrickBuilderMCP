@@ -1,11 +1,10 @@
 """High-level building helpers — real LEGO masonry, not stacked boxes.
 
-Phase 2 rewrite. Goals:
+Goals:
 - `build_wall_segment` produces a row-by-row staggered wall (seams shift per
   row); ends are filled with shorter bricks from the palette as needed.
-- `build_room` builds four walls AND interlocks the corners by alternating
-  which wall extends into the corner on each row. No standalone corner
-  column.
+- `build_room` builds a bonded rectangular perimeter by alternating which wall
+  direction owns each corner on each row. No standalone corner column.
 - All semantic helpers default to strict grid alignment (x, z on the
   half-stud grid, y on plate-aligned positions). Raw `add_part` stays
   permissive.
@@ -26,6 +25,7 @@ from typing import Any, Iterable
 BRICK_H = 24
 STUD = 20
 PALETTE_DEFAULT_BODY = ("3010", "3004", "3005")   # 1x4, 1x2, 1x1 brick lengths
+PALETTE_TWO_STUD_WALL = ("3001", "3002", "3003")  # 2x4, 2x3, 2x2 brick lengths
 _BRICK_LENGTH_LDU = {
     # Bricks
     "3010": 80, "3004": 40, "3005": 20, "3622": 60, "3009": 120, "3008": 160,
@@ -100,6 +100,32 @@ def _row_seams(plan: list[tuple[str, int]]) -> set[int]:
         final_end = sum(_BRICK_LENGTH_LDU[pid] for pid, _ in plan)
         seams.discard(final_end)
     return seams
+
+
+def _plan_seams(plan: list[tuple[str, int]], length: int) -> set[int]:
+    """Internal seam positions for a plan of known total length."""
+    cursor = 0
+    seams: set[int] = set()
+    for pid, _ in plan:
+        cursor += _BRICK_LENGTH_LDU[pid]
+        seams.add(cursor)
+    seams.discard(length)
+    return seams
+
+
+def _pick_brick_run_world(length_ldu: int, start_world: float, avoid_world_seams: set[int],
+                          palette: Iterable[str]) -> tuple[list[tuple[str, int]], set[int]] | None:
+    """Pick a row plan using world-space seam positions for stagger checks."""
+    avoid_relative = {
+        seam - int(round(start_world))
+        for seam in avoid_world_seams
+        if 0 < seam - int(round(start_world)) < length_ldu
+    }
+    plan = _pick_brick_run(length_ldu, avoid_relative, palette=palette)
+    if plan is None:
+        return None
+    relative = _plan_seams(plan, length_ldu)
+    return plan, {int(round(start_world)) + seam for seam in relative}
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +260,206 @@ def build_corner(x: float, z: float, height_rows: int,
 
 
 # ---------------------------------------------------------------------------
-# build_room — four interlocking walls + corners
+# build_perimeter — generic rectilinear bonded outline
+# ---------------------------------------------------------------------------
+
+def _normalize_points(points: list | tuple) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for p in points:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            raise ValueError("points must be a list of [x, z] pairs")
+        out.append((float(p[0]), float(p[1])))
+    if len(out) > 1 and out[0] == out[-1]:
+        out.pop()
+    if len(out) < 4:
+        raise ValueError("perimeter needs at least 4 points")
+    return out
+
+
+def _polygon_area_xz(points: list[tuple[float, float]]) -> float:
+    area = 0.0
+    for i, (x0, z0) in enumerate(points):
+        x1, z1 = points[(i + 1) % len(points)]
+        area += x0 * z1 - x1 * z0
+    return area / 2
+
+
+def _validate_perimeter_points(points: list[tuple[float, float]],
+                               strict_grid: bool) -> None:
+    if abs(_polygon_area_xz(points)) < 0.1:
+        raise ValueError("perimeter points must enclose non-zero area")
+    for i, (x0, z0) in enumerate(points):
+        x1, z1 = points[(i + 1) % len(points)]
+        if strict_grid:
+            for v, name in ((x0, "x"), (z0, "z")):
+                if abs(v - round(v / 10) * 10) > 0.1:
+                    raise ValueError(f"point {i} {name}={v} not on half-stud grid")
+        if abs(x1 - x0) > 0.1 and abs(z1 - z0) > 0.1:
+            raise ValueError(
+                f"edge {i} is diagonal; build_perimeter currently needs orthogonal points")
+
+
+def _corner_kinds(points: list[tuple[float, float]]) -> list[str]:
+    """Return 'convex'/'concave' per vertex for an orthogonal polygon."""
+    ccw = _polygon_area_xz(points) > 0
+    kinds: list[str] = []
+    n = len(points)
+    for i, (x, z) in enumerate(points):
+        px, pz = points[(i - 1) % n]
+        nx, nz = points[(i + 1) % n]
+        prev_dx, prev_dz = x - px, z - pz
+        next_dx, next_dz = nx - x, nz - z
+        cross = prev_dx * next_dz - prev_dz * next_dx
+        if abs(cross) < 0.1:
+            raise ValueError(f"point {i} is collinear; remove redundant perimeter points")
+        is_convex = cross > 0 if ccw else cross < 0
+        kinds.append("convex" if is_convex else "concave")
+    return kinds
+
+
+def _perimeter_edges(points: list[tuple[float, float]], thickness: float,
+                     ) -> list[dict[str, Any]]:
+    """Return shifted edge descriptors for a rectilinear outer outline."""
+    ccw = _polygon_area_xz(points) > 0
+    corner_kinds = _corner_kinds(points)
+    edges: list[dict[str, Any]] = []
+    for i, (x0, z0) in enumerate(points):
+        x1, z1 = points[(i + 1) % len(points)]
+        dx, dz = x1 - x0, z1 - z0
+        if abs(dx) >= abs(dz):
+            sign = 1 if dx > 0 else -1
+            # Interior lies left of each directed edge for CCW outlines.
+            inward_z = sign if ccw else -sign
+            fixed = z0 + inward_z * thickness / 2
+            start, end = sorted((x0, x1))
+            axis = "x"
+            start_vertex = i if x0 <= x1 else (i + 1) % len(points)
+            end_vertex = (i + 1) % len(points) if x0 <= x1 else i
+        else:
+            sign = 1 if dz > 0 else -1
+            inward_x = -sign if ccw else sign
+            fixed = x0 + inward_x * thickness / 2
+            start, end = sorted((z0, z1))
+            axis = "z"
+            start_vertex = i if z0 <= z1 else (i + 1) % len(points)
+            end_vertex = (i + 1) % len(points) if z0 <= z1 else i
+        length = end - start
+        if length < thickness * 2 - 0.1:
+            raise ValueError(
+                f"edge {i} is too short ({length:g} LDU) for {thickness:g} LDU thick bonded walls")
+        edges.append({
+            "name": f"edge_{i}",
+            "axis": axis,
+            "start": start,
+            "end": end,
+            "fixed": fixed,
+            "length": length,
+            "from": [x0, z0],
+            "to": [x1, z1],
+            "start_corner": corner_kinds[start_vertex],
+            "end_corner": corner_kinds[end_vertex],
+        })
+    return edges
+
+
+def build_perimeter(points: list,
+                    height_rows: int = 5,
+                    color: str | int = "light_bluish_gray",
+                    base_y: float = -4,
+                    thickness_studs: int = 2,
+                    palette: list[str] | None = None,
+                    strict_grid: bool = True,
+                    ) -> dict[str, Any]:
+    """Build a bonded rectilinear wall outline from outer-corner points.
+
+    This is the generic primitive behind `build_room`: provide a closed
+    orthogonal footprint as `[[x,z], ...]`. Each course alternates axis
+    ownership at corners, so row N bridges the corner seams from row N-1.
+    """
+    if height_rows <= 0:
+        raise ValueError("height_rows must be positive")
+    if thickness_studs not in (1, 2):
+        raise ValueError("thickness_studs currently supports 1 or 2")
+    if abs(base_y - round(base_y / 4) * 4) > 0.1:
+        raise ValueError(f"base_y={base_y} not on quarter-plate grid")
+
+    pts = _normalize_points(points)
+    _validate_perimeter_points(pts, strict_grid)
+    thickness = thickness_studs * STUD
+    pal = list(palette or (PALETTE_TWO_STUD_WALL if thickness_studs == 2 else PALETTE_DEFAULT_BODY))
+    edges = _perimeter_edges(pts, thickness)
+
+    placed_total = 0
+    prev_seams: dict[str, set[int]] = {edge["name"]: set() for edge in edges}
+    rows: list[dict[str, Any]] = []
+
+    def adjusted_endpoint(value: float, corner_kind: str, owns_corner: bool,
+                          is_start: bool) -> float:
+        if corner_kind == "convex":
+            if owns_corner:
+                return value
+            return value + thickness if is_start else value - thickness
+        # At reentrant corners, the owning course must reach past the nominal
+        # vertex so the next course can overlap it. Otherwise L/T-shaped
+        # footprints leave visually-near but unbonded corner strips.
+        if owns_corner:
+            return value - thickness if is_start else value + thickness
+        return value
+
+    def place_edge(edge: dict[str, Any], y: float, owns_corner: bool) -> dict[str, Any]:
+        nonlocal placed_total
+        start = adjusted_endpoint(edge["start"], edge["start_corner"], owns_corner, True)
+        end = adjusted_endpoint(edge["end"], edge["end_corner"], owns_corner, False)
+        length = int(round(end - start))
+        if length <= 0:
+            raise ValueError(f"{edge['name']} row at y={y}: no span remains after corner inset")
+        picked = _pick_brick_run_world(length, start, prev_seams[edge["name"]], palette=pal)
+        if picked is None:
+            picked = _pick_brick_run_world(length, start, set(), palette=pal)
+        if picked is None:
+            raise ValueError(f"{edge['name']} row at y={y}: no brick fit for length={length}")
+        plan, world_seams = picked
+        if edge["axis"] == "x":
+            ids = _place_row_x(start, edge["fixed"], y, plan, color)
+        else:
+            ids = _place_row_z(edge["fixed"], start, y, plan, color)
+        placed_total += len(ids)
+        prev_seams[edge["name"]] = world_seams
+        return {
+            "name": edge["name"],
+            "axis": edge["axis"],
+            "owns_corner": owns_corner,
+            "bricks": len(ids),
+            "length": length,
+            "start": start,
+            "end": end,
+            "fixed": edge["fixed"],
+            "start_corner": edge["start_corner"],
+            "end_corner": edge["end_corner"],
+            "seams": sorted(world_seams),
+        }
+
+    for row in range(height_rows):
+        y = base_y - row * BRICK_H
+        owning_axis = "x" if row % 2 == 0 else "z"
+        row_segments = [place_edge(edge, y, edge["axis"] == owning_axis)
+                        for edge in edges]
+        rows.append({"row": row, "y": y, "owning_axis": owning_axis,
+                     "segments": row_segments})
+
+    return {
+        "ok": True,
+        "bricks_placed": placed_total,
+        "subassembly": _server().STATE.current_subassembly,
+        "rows": rows,
+        "points": [[x, z] for x, z in pts],
+        "wall_thickness_studs": thickness_studs,
+        "palette": pal,
+    }
+
+
+# ---------------------------------------------------------------------------
+# build_room — rectangle wrapper around build_perimeter
 # ---------------------------------------------------------------------------
 
 def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
@@ -242,106 +467,28 @@ def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
                 color: str | int = "light_bluish_gray",
                 base_y: float = -4,
                 strict_grid: bool = True,
+                palette: list[str] | None = None,
                 ) -> dict[str, Any]:
-    """Build a rectangular hollow room.
+    """Build a rectangular hollow room with bonded corners.
 
-    Construction:
-    - 2x2 brick (3003) at each corner, stacked vertically (rotation-symmetric,
-      so adjacent rows always connect via 4 shared studs).
-    - 4 wall segments around the perimeter, each ending flush with the corner
-      brick. Wall bricks stagger seams from row to row inside each wall
-      segment via the brick-picker.
-
-    Note: this isn't fully bonded masonry (the corner columns are connected
-    only vertically, not laterally into the wall bricks). For maximum
-    structural realism the LLM should lay corners manually using
-    place_on_top + alternating rotation. This helper picks "buildable +
-    visually right" over "structurally interlocked."
+    Convenience wrapper for `build_perimeter` using rectangular outer points.
     """
-    s = _server()
     if strict_grid:
         for v, name in ((x_min, "x_min"), (x_max, "x_max"),
                          (z_min, "z_min"), (z_max, "z_max")):
             if abs(v - round(v / 10) * 10) > 0.1:
                 raise ValueError(f"{name}={v} not on half-stud grid")
-
-    CORNER_PART = "3003"   # 2x2 brick (rotation-symmetric — connects between rows reliably)
-    CORNER_HALF = _BRICK_LENGTH_LDU[CORNER_PART] / 2   # 20 LDU
-    THICKNESS = STUD                                   # wall is 1 stud thick
-
-    z_south = z_min + THICKNESS / 2
-    z_north = z_max - THICKNESS / 2
-    x_west = x_min + THICKNESS / 2
-    x_east = x_max - THICKNESS / 2
-
-    corners = {
-        "sw": (x_west, z_south),
-        "se": (x_east, z_south),
-        "nw": (x_west, z_north),
-        "ne": (x_east, z_north),
-    }
-
-    placed_total = 0
-    prev_seam_x: set[int] = set()
-    prev_seam_z: set[int] = set()
-    pal = list(PALETTE_DEFAULT_BODY)
-
-    # The wall segments INSET by 20 LDU (half the 2x2 corner brick) on each end
-    # so they end flush with the corner column's near face.
-    wall_x_start = x_west + CORNER_HALF
-    wall_x_end = x_east - CORNER_HALF
-    length_x = int(round(wall_x_end - wall_x_start))
-    wall_z_start = z_south + CORNER_HALF
-    wall_z_end = z_north - CORNER_HALF
-    length_z = int(round(wall_z_end - wall_z_start))
-
-    for row in range(height_rows):
-        y = base_y - row * BRICK_H
-
-        # Corner columns
-        for (cx, cz) in corners.values():
-            s.add_part(CORNER_PART, color, cx, y, cz, rotation="identity")
-            placed_total += 1
-
-        # X-walls (south + north)
-        if length_x > 0:
-            plan_x = _pick_brick_run(length_x, prev_seam_x, palette=pal)
-            if plan_x is None:
-                plan_x = _pick_brick_run(length_x, set(), palette=pal)
-            if plan_x is None:
-                return {"ok": False, "reason": f"x-walls row {row}: no brick fit for length={length_x}"}
-            _place_row_x(wall_x_start, z_south, y, plan_x, color)
-            _place_row_x(wall_x_start, z_north, y, plan_x, color)
-            placed_total += 2 * len(plan_x)
-            cur = 0
-            this_seams_x = set()
-            for pid, _ in plan_x:
-                cur += _BRICK_LENGTH_LDU[pid]
-                this_seams_x.add(cur)
-            this_seams_x.discard(length_x)
-            prev_seam_x = this_seams_x
-
-        # Z-walls (west + east)
-        if length_z > 0:
-            plan_z = _pick_brick_run(length_z, prev_seam_z, palette=pal)
-            if plan_z is None:
-                plan_z = _pick_brick_run(length_z, set(), palette=pal)
-            if plan_z is None:
-                return {"ok": False, "reason": f"z-walls row {row}: no brick fit for length={length_z}"}
-            _place_row_z(x_west, wall_z_start, y, plan_z, color)
-            _place_row_z(x_east, wall_z_start, y, plan_z, color)
-            placed_total += 2 * len(plan_z)
-            cur = 0
-            this_seams_z = set()
-            for pid, _ in plan_z:
-                cur += _BRICK_LENGTH_LDU[pid]
-                this_seams_z.add(cur)
-            this_seams_z.discard(length_z)
-            prev_seam_z = this_seams_z
-
-    return {"ok": True, "bricks_placed": placed_total,
-            "subassembly": s.STATE.current_subassembly,
-            "rows": height_rows}
+    if x_max <= x_min or z_max <= z_min:
+        raise ValueError("room bounds must have positive width and depth")
+    return build_perimeter(
+        points=[[x_min, z_min], [x_max, z_min], [x_max, z_max], [x_min, z_max]],
+        height_rows=height_rows,
+        color=color,
+        base_y=base_y,
+        thickness_studs=2,
+        palette=palette,
+        strict_grid=strict_grid,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +647,10 @@ def suggest_next_brick_for_wall(subassembly: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def register_helpers(mcp) -> None:
+    mcp.tool()(build_wall)
     mcp.tool()(build_wall_segment)
     mcp.tool()(build_corner)
+    mcp.tool()(build_perimeter)
     mcp.tool()(build_room)
     mcp.tool()(build_floor)
     mcp.tool()(repeat_pattern)
