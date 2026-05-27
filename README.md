@@ -6,7 +6,11 @@ An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **build
 
 Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets ~50 semantic tools, 6 prompts, and 4 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
-> **Status**: alpha but functional end-to-end. **128 tests passing.** Verified working under Claude Desktop with inline image rendering in chat.
+> **Status: very early days.** The pipeline runs end-to-end — install, talk to Claude, get an exportable `.ldr` — and the tests pass, but please calibrate your expectations: **this project is just getting started.**
+>
+> **Designing LEGO models with an LLM is *hard and slow*.** The model has to reason about 3D geometry, brick connectivity, stagger / bond patterns, color, and structural soundness, *and* keep all that consistent across dozens of tool calls without losing the plot. Even simple builds (a small house, a basic vehicle) take a long conversation and a handful of restarts. Complex builds (anything organic, anything curved, anything with realistic proportions) are not yet within reach of the prompts and tools shipped here. The semantic toolkit is what makes any of this *possible*; getting it to be *fluent* is the actual research problem, and that's the part still being worked on.
+>
+> The **renderer**, the **catalog**, the **import/export** path, and the **CLI** are the parts that are working well today. Treat the rest as a workbench.
 
 ---
 
@@ -233,15 +237,20 @@ All four return `[markdown_preview, summary_dict, MCPImage]` — the human sees 
 
 #### Stress test: importing a 9,361-part Star Destroyer
 
-`import_ldr("10030-1.mpd")` followed by `render_model(1600, 1100)` on the **Imperial Star Destroyer (set 10030)** — 9,361 parts across 135 sub-modules, ~7,290 of them carrying non-canonical rotation matrices (the angled hull plating). Import: **0.09 s**. The two renders below are the same scene from the same camera, using two different rendering strategies:
-
-![AABB-cuboid render of the ISD: every part drawn as its bounding box; ship silhouette and bridge tower correct, but curves and slopes appear blocky](docs/images/star_destroyer_aabb.png)
-
-*🪨 **AABB renderer (default, currently in the codebase)** — every part is drawn as its world-space bounding cuboid. Useful: the silhouette and scale are correct, every imported part is positioned and rotated faithfully, and you can see at a glance whether the loader walked the sub-module hierarchy correctly. Limitation: curves, slopes, and engine details all live as triangle/quad geometry inside the `.dat` files we're not reading yet, so the ship looks like a stack of grey blocks. ~5.3 s render → 140 KB PNG.*
+`import_ldr("10030-1.mpd")` followed by `render_model(...)` on the **Imperial Star Destroyer (set 10030)** — 9,361 parts across 135 sub-modules, ~7,290 of them carrying non-canonical rotation matrices (the angled hull plating). Import: **0.09 s**.
 
 ![Mesh-based render of the ISD: real LDraw triangle and quad geometry projected — smooth hull plating, engine glow rings, antenna structures all visible](docs/images/star_destroyer_mesh.png)
 
-*✨ **Mesh-based renderer (in progress)** — reads real LDraw triangle/quad geometry directly from each `.dat` file and projects it. Same scene, same camera, same parsing pipeline — just hooked up to the catalog's actual geometry. The bridge superstructure, antenna dishes, engine block, and angled hull plating all render in true shape. This is what the renderer aims for; the AABB path stays as the fast fallback for when the library isn't installed.*
+*✨ **Current renderer.** Reads the real triangle/quad geometry inside each `.dat` file and projects it directly. Bridge superstructure, three engine exhaust rings at the rear, antenna dishes, angled hull plating — all in true shape. Same parsing/transform pipeline that import_ldr uses, just hooked up to the catalog's actual mesh data.*
+
+<details>
+<summary>Earlier draft of the renderer, kept around because it looks funny</summary>
+
+![AABB-cuboid render of the ISD: every part drawn as its bounding box; ship silhouette and bridge tower correct, but curves and slopes appear blocky](docs/images/star_destroyer_aabb.png)
+
+*🪨 The first cut of the renderer drew each part as its world-space bounding cuboid. The silhouette and scale are correct — every part is positioned and rotated faithfully, you can clearly see the loader walked the 135-sub-module hierarchy correctly — but slopes, curves, and engine details all became chunky stacks of grey blocks. Useful while debugging the loader / transform pipeline. It looks like a Minecraft Star Destroyer.*
+
+</details>
 
 > Builder mode isn't trained to design anything this complex yet — semantic tools for greebling, wing-plate panel boundaries, and curved-hull techniques are future work. But the **import + render path holds up at this scale** today: you can load any OMR model, inspect it, run validation on it, and start chipping away.
 >
