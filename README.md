@@ -35,6 +35,7 @@ Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan ba
 - [Prompts (slash menu)](#prompts-slash-menu)
 - [Resources](#resources)
 - [Run as a standalone agent](#run-as-a-standalone-agent-no-claude-desktop)
+- [Standalone CLI: `lego-mcp render`](#standalone-cli-lego-mcp-render)
 - [Development](#development)
 - [Known limitations](#known-limitations)
 - [License](#license)
@@ -230,11 +231,17 @@ All four return `[markdown_preview, summary_dict, MCPImage]` — the human sees 
 
 *`render_validation()` on a clean `build_room`: every part is green — no collisions, nothing floating, nothing off-grid. When something is wrong, the offending parts switch color (**red** = collision, **orange** = floating, **purple** = unanchored, **yellow** = off-grid, **gray** = unknown part_id) so you can spot problems at a glance.*
 
-#### The renderer scales: importing a 9,361-part Star Destroyer
+#### Stress test: importing a 9,361-part Star Destroyer
 
-![Imperial Star Destroyer 10030 imported from the official LDraw model repository and rendered by LegoMCP — full triangular hull, bridge tower, and engine block visible at iso angle](docs/images/star_destroyer.png)
+`import_ldr("10030-1.mpd")` followed by `render_model(1600, 1100)` on the **Imperial Star Destroyer (set 10030)** — 9,361 parts across 135 sub-modules, ~7,290 of them carrying non-canonical rotation matrices (the angled hull plating). Import: **0.09 s**. The two renders below are the same scene from the same camera, using two different rendering strategies:
 
-*`import_ldr("10030-1.mpd")` followed by `render_model(1600, 1100)` on the **Imperial Star Destroyer (set 10030)**. 9,361 parts across 135 sub-modules, ~7,290 of them carrying non-canonical rotation matrices (the angled hull plating). Import: **0.09 s**. Render: **5.3 s** → 140 KB PNG.*
+![AABB-cuboid render of the ISD: every part drawn as its bounding box; ship silhouette and bridge tower correct, but curves and slopes appear blocky](docs/images/star_destroyer_aabb.png)
+
+*🪨 **AABB renderer (default, currently in the codebase)** — every part is drawn as its world-space bounding cuboid. Useful: the silhouette and scale are correct, every imported part is positioned and rotated faithfully, and you can see at a glance whether the loader walked the sub-module hierarchy correctly. Limitation: curves, slopes, and engine details all live as triangle/quad geometry inside the `.dat` files we're not reading yet, so the ship looks like a stack of grey blocks. ~5.3 s render → 140 KB PNG.*
+
+![Mesh-based render of the ISD: real LDraw triangle and quad geometry projected — smooth hull plating, engine glow rings, antenna structures all visible](docs/images/star_destroyer_mesh.png)
+
+*✨ **Mesh-based renderer (in progress)** — reads real LDraw triangle/quad geometry directly from each `.dat` file and projects it. Same scene, same camera, same parsing pipeline — just hooked up to the catalog's actual geometry. The bridge superstructure, antenna dishes, engine block, and angled hull plating all render in true shape. This is what the renderer aims for; the AABB path stays as the fast fallback for when the library isn't installed.*
 
 > Builder mode isn't trained to design anything this complex yet — semantic tools for greebling, wing-plate panel boundaries, and curved-hull techniques are future work. But the **import + render path holds up at this scale** today: you can load any OMR model, inspect it, run validation on it, and start chipping away.
 >
@@ -327,6 +334,67 @@ uv run python -m lego_mcp.agent "build me a 16x12 stud room, 5 bricks high"
 ```
 
 The agent spawns `lego-mcp` as a subprocess, fetches the tool list over MCP JSON-RPC, hands the tools to Claude via the Anthropic SDK, and loops until Claude stops calling tools. Final model exported to `./agent_build.mpd` and rendered.
+
+---
+
+## Standalone CLI: `lego-mcp render`
+
+For when you want to render an `.ldr` / `.mpd` file from the shell — previewing an OMR download, batching renders for a website, generating a turntable, or just sanity-checking a model someone sent you — without spinning up the MCP server or opening Claude Desktop.
+
+```bash
+lego-mcp render path/to/model.mpd                          # writes model.png next to the input
+lego-mcp render model.mpd -o /tmp/out.png -w 1600 -H 1100  # explicit output + dimensions
+lego-mcp render model.mpd --color-mode instance            # one color per piece (debug)
+lego-mcp render model.mpd --hidden-edges                   # show internal contact faces as dotted lines
+lego-mcp render model.mpd --view-angle 90                  # camera 90° around the Y-axis
+lego-mcp render model.mpd --turntable 24                   # 24 frames sweeping 360° → model_000.png … model_023.png
+lego-mcp render model.mpd --background "#0a0a0a"           # dark background
+lego-mcp render model.mpd \
+    --watermark "ACME © 2026" \
+    --watermark-position bottom-right \
+    --watermark-color "#ffffff" \
+    --watermark-opacity 200
+lego-mcp render --help                                     # full help
+```
+
+All flags:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `<input>` *(positional)* | — | Path to an `.ldr` or `.mpd` file. |
+| `-o, --output PATH` | `<input-stem>.png` next to input | Output PNG path. |
+| `-w, --width N` | `1200` | Image width in pixels. |
+| `-H, --height N` | `900` | Image height in pixels. (`-h` is reserved for help.) |
+| `--color-mode {model,instance,row,rotation}` | `model` | `model` = actual colors; `instance` = one color per piece; `row` = color by brick course; `rotation` = color by orientation. |
+| `--hidden-edges` | off | Draw fully-covered contact faces as dotted guide lines. |
+| `--view-angle DEG` | `0` | Camera azimuth (yaw around Y). 0 = default iso view; `45` rolls to a flat front elevation; `90` shows the next corner. Pitch stays at 30°. |
+| `--turntable N` | — | Instead of one image, write **N frames** sweeping 360°. Each frame goes to `<stem>_NNN.png`. Overrides `--view-angle`. |
+| `--background #RRGGBB` | `#f5f5f8` | Image background color. Accepts `#fff` shorthand. |
+| `--watermark TEXT` | — | Overlay text on the rendered image. |
+| `--watermark-position {top-left,top-right,bottom-left,bottom-right}` | `bottom-right` | Where to draw the watermark. |
+| `--watermark-color #RRGGBB` | `#282828` | Watermark text color. |
+| `--watermark-opacity N` | `140` | Watermark alpha (0 transparent .. 255 opaque). |
+| `--watermark-size N` | `18` | Watermark font size in px. |
+| `--watermark-margin N` | `14` | Watermark distance from image edges, in px. |
+| `-q, --quiet` | off | Suppress progress lines on stdout. |
+
+The watermark draws with a TTF font when one is available (Helvetica / Arial / DejaVu probed in order), falling back to PIL's bitmap default on minimal systems so it never hard-fails.
+
+### One-liner recipes
+
+```bash
+# Generate a hero image for a model with a tagline
+lego-mcp render hero.mpd -o hero.png -w 1920 -H 1080 \
+    --watermark "Built with LegoMCP" --watermark-opacity 90
+
+# Compare two color modes side-by-side (re-run with different --color-mode)
+lego-mcp render m.mpd -o m_model.png   --color-mode model
+lego-mcp render m.mpd -o m_instance.png --color-mode instance
+
+# Spin a 36-frame turntable for an animation
+lego-mcp render m.mpd --turntable 36 -o /tmp/spin.png
+# → /tmp/spin_000.png … /tmp/spin_035.png — feed into ffmpeg / a GIF tool
+```
 
 ---
 
