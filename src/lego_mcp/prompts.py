@@ -90,6 +90,31 @@ TECHNIQUES_BLURB = """\
 """
 
 
+# The auto-delivered "user manual". Reaches the LLM through two guaranteed
+# channels (MCP prompts only fire when the human picks them from the menu):
+# 1. FastMCP `instructions` — sent to the client at connection time.
+# 2. The `create_model` tool result — the first call of every build.
+MANUAL = f"""\
+# LegoMCP — how to build models that actually exist
+
+{COORDS_BLURB}
+{CONNECTIONS_BLURB}
+{WORKFLOW_BLURB}
+**Tool order of preference**:
+1. High-level helpers: `build_room`, `build_wall_segment`, `build_perimeter`, \
+`build_wall_with_openings`, `build_floor`, `build_stepped_gable_roof` / \
+`_pyramid_roof` — they handle stagger, corners, and stud alignment.
+2. Connection-guaranteed placement: `find_valid_placements(part_id, near_id)` \
+→ `add_part_at_placement(token, color)`, or `place_on_top(...)`.
+3. Raw `add_part(x, y, z)` only as a debug fallback — and then heed the \
+`connectivity` / `warnings` in its result.
+
+More depth on demand: resources `lego://techniques` (masonry, SNOT, roofs), \
+`lego://connections`, `lego://coords`, `lego://workflow`; the `start` prompt \
+has the full tool tour.
+"""
+
+
 def _user(text: str) -> dict:
     return {"role": "user", "content": text}
 

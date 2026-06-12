@@ -148,7 +148,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 | Tool | What it does |
 |---|---|
-| `create_model(name)` | Reset to a fresh empty model. |
+| `create_model(name, include_manual=True)` | Reset to a fresh empty model. The result carries `getting_started` — the building manual (coordinates, connection rules, workflow, tool order) — so the LLM gets the rules at the exact moment a build begins. The same manual ships as MCP server `instructions` at connection time. |
 | `list_parts(limit, subassembly)` | List current parts (optionally filtered to one subassembly). |
 
 ### Placement (raw)

@@ -212,3 +212,21 @@ def test_build_wall_produces_fully_connected_wall():
     assert r["summary"]["floating"] == 0
     assert r["summary"]["unanchored"] == 0
     assert r["summary"]["connections"] > 0
+
+
+# ---------------------------------------------------------------------------
+# The manual reaches the LLM without anyone asking for it
+# ---------------------------------------------------------------------------
+
+def test_create_model_delivers_manual():
+    r = server.create_model("manual_check")
+    manual = r["getting_started"]
+    for needle in ("stud", "FLOATING", "find_valid_placements", "-Y"):
+        assert needle in manual
+    r2 = server.create_model("no_manual", include_manual=False)
+    assert "getting_started" not in r2
+
+
+def test_server_instructions_carry_manual():
+    assert server.mcp.instructions
+    assert "stud" in server.mcp.instructions

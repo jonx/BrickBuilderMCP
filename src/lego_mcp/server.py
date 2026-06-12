@@ -571,7 +571,11 @@ def _inst_dict(inst: PartInstance) -> dict[str, Any]:
 # FastMCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("lego-mcp")
+# The getting-started manual rides the MCP handshake (`instructions`) so any
+# client that surfaces server instructions gives the LLM the rules up front.
+from lego_mcp.prompts import MANUAL as _MANUAL
+
+mcp = FastMCP("lego-mcp", instructions=_MANUAL)
 
 
 def _reset_state(name: str, keep_checkpoints: bool = False) -> None:
@@ -590,10 +594,20 @@ def _reset_state(name: str, keep_checkpoints: bool = False) -> None:
 
 
 @mcp.tool()
-def create_model(name: str = "untitled") -> dict[str, Any]:
-    """Start a fresh, empty model. Clears parts, undo, redo, and checkpoints."""
+def create_model(name: str = "untitled", include_manual: bool = True) -> dict[str, Any]:
+    """Start a fresh, empty model. Clears parts, undo, redo, and checkpoints.
+
+    The result includes `getting_started` — the building manual (coordinate
+    convention, how stud connections work, recommended workflow and tool
+    order). READ IT before placing parts; it is the difference between models
+    that exist and models that don't. Pass include_manual=False to skip it
+    (e.g. scripted resets mid-session).
+    """
     _reset_state(name)
-    return {"ok": True, "name": name, "parts": 0}
+    out: dict[str, Any] = {"ok": True, "name": name, "parts": 0}
+    if include_manual:
+        out["getting_started"] = _MANUAL
+    return out
 
 
 @mcp.tool()
