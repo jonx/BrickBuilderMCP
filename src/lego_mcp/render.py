@@ -392,7 +392,12 @@ def render_model_png(
 
     `view_angle`: camera azimuth in degrees, rotating around the world Y-axis
     (LDraw's vertical). 0 keeps the default iso view; +90 spins the camera a
-    quarter-turn clockwise as seen from above. Pitch stays at 30°.
+    quarter-turn clockwise as seen from above. Pitch stays constant — the
+    yaw-then-project transform is exactly an orthographic camera orbit.
+    Note: the default view looks along the ground diagonal, so view_angle
+    values near 45/135/225/315 face the model almost head-on; orthographic
+    face-on views have no horizontal depth offset and read as flat/sheared.
+    Prefer multiples of 90 for presentation renders.
     """
     from lego_mcp.parts import color_rgb
     from lego_mcp.server import part_aabb_world

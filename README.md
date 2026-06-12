@@ -377,7 +377,7 @@ All flags:
 | `-H, --height N` | `900` | Image height in pixels. (`-h` is reserved for help.) |
 | `--color-mode {model,instance,row,rotation}` | `model` | `model` = actual colors; `instance` = one color per piece; `row` = color by brick course; `rotation` = color by orientation. |
 | `--hidden-edges` | off | Draw fully-covered contact faces as dotted guide lines. |
-| `--view-angle DEG` | `0` | Camera azimuth (yaw around Y). 0 = default iso view; `45` rolls to a flat front elevation; `90` shows the next corner. Pitch stays at 30°. |
+| `--view-angle DEG` | `0` | Camera azimuth (yaw around Y), pitch constant. **Use multiples of 90 for presentation renders** — they show the other corners with the same classic iso look. Angles near `45/135/225/315` face the model almost head-on, and orthographic face-on views have no horizontal depth offset, so they read as flat/"sheared" (correct, but hard on the eyes). |
 | `--turntable N` | — | Instead of one image, write **N frames** sweeping 360°. Each frame goes to `<stem>_NNN.png`. Overrides `--view-angle`. |
 | `--background #RRGGBB` | `#f5f5f8` | Image background color. Accepts `#fff` shorthand. |
 | `--watermark TEXT` | — | Overlay text on the rendered image. |

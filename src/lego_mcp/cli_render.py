@@ -103,8 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Draw fully-covered contact faces as dotted lines.")
     p.add_argument("--view-angle", type=float, default=0.0, metavar="DEG",
                    help=("Camera azimuth in degrees, rotating around the world "
-                         "Y-axis. 0 = default iso view; try 45, 90, 135, 180, "
-                         "etc. to spin around the model. Default: 0."))
+                         "Y-axis. 0 = default iso view. Multiples of 90 give "
+                         "the classic diagonal look from the other corners. "
+                         "Angles near 45/135/225/315 look at the model almost "
+                         "face-on — geometrically correct, but orthographic "
+                         "face-on views project flat and depth-ambiguous, so "
+                         "they read as 'sheared'. Default: 0."))
     p.add_argument("--turntable", type=int, default=None, metavar="N",
                    help=("Instead of one image, write N renders sweeping a full "
                          "360°. With --output set, the path gets a _NNN suffix "
