@@ -60,8 +60,9 @@ class Connector:
 class PartDefinition:
     """A typed view of a Part used by the connection-aware model.
 
-    Built from `parts.Part` for the supported subset; other parts use the
-    underlying AABB-based path.
+    Built from `parts.Part` data for ANY catalog part (see
+    `definition_from_part`); a small legacy subset is precomputed in
+    `SUPPORTED_DEFINITIONS`.
     """
     part_id: str
     name: str
@@ -139,9 +140,81 @@ SUPPORTED_DEFINITIONS: dict[str, PartDefinition] = {
 }
 
 
+def _footprint_grid_xz(part: Part) -> list[tuple[float, float]]:
+    """Stud-grid XZ positions derived from the part's footprint."""
+    nx = max(1, int(round(part.width / STUD)))
+    nz = max(1, int(round(part.depth / STUD)))
+    return [(i * STUD - part.width / 2 + STUD / 2,
+             j * STUD - part.depth / 2 + STUD / 2)
+            for i in range(nx) for j in range(nz)]
+
+
+# Builtin-catalog parts carry no extracted stud geometry. For those we
+# synthesize a footprint stud grid when the name says the top is studded.
+# (Library parts always prefer their extracted stud positions; for builtin
+# slopes the full grid overstates the studded area — acceptable until the
+# library is installed.)
+_SYNTH_TOP_STUD_PREFIXES = ("brick", "plate", "baseplate", "slope")
+
+
+def definition_from_part(part: Part) -> PartDefinition:
+    """Build a typed connector view from parsed LDraw part data. Works for
+    ANY catalog part, not just the legacy supported subset.
+
+    - Top studs: the part's extracted stud positions (real .dat geometry)
+      when available, else a synthesized footprint grid for name-identified
+      studded parts (builtin fallback catalog). Tiles get none.
+    - Bottom receivers: the footprint receptor grid from
+      `connections.receptor_positions` — empty for baseplates.
+
+    Extracted stud coords are raw LDraw part-local (origin at the top face),
+    but instances use the bottom-face-origin convention — so only the stud XZ
+    is trusted and Y is normalized to -height, same as
+    `connections.find_placements_b_on_a` does.
+    """
+    from lego_mcp.connections import receptor_positions
+
+    top_y = -float(part.height)
+    if part.studs:
+        studs = [(x, top_y, z) for (x, _y, z) in part.studs]
+    elif part.name.strip().lower().startswith(_SYNTH_TOP_STUD_PREFIXES):
+        studs = [(x, top_y, z) for x, z in _footprint_grid_xz(part)]
+    else:
+        studs = []
+    connectors = [Connector(ConnectorType.STUD_TOP, x, y, z)
+                  for (x, y, z) in studs]
+    connectors += [Connector(ConnectorType.STUD_RECEIVER_BOTTOM, x, y, z)
+                   for (x, y, z) in receptor_positions(part)]
+    return PartDefinition(
+        part_id=part.part_id,
+        name=part.name,
+        width_studs=max(1, int(round(part.width / STUD))),
+        depth_studs=max(1, int(round(part.depth / STUD))),
+        height_plates=max(1, int(round(part.height / PLATE_HEIGHT))),
+        connectors=tuple(connectors),
+    )
+
+
+_DYNAMIC_DEFINITIONS: dict[str, PartDefinition | None] = {}
+
+
 def definition_for(part_id: str) -> PartDefinition | None:
-    """Return a PartDefinition for the supported subset; None for other parts."""
-    return SUPPORTED_DEFINITIONS.get(part_id)
+    """Return a PartDefinition for any known catalog part; None if unknown."""
+    d = SUPPORTED_DEFINITIONS.get(part_id)
+    if d is not None:
+        return d
+    if part_id in _DYNAMIC_DEFINITIONS:
+        return _DYNAMIC_DEFINITIONS[part_id]
+    from lego_mcp.server import PART_INDEX  # lazy: avoid circular import
+    part = PART_INDEX.get(part_id)
+    defn = definition_from_part(part) if part is not None else None
+    _DYNAMIC_DEFINITIONS[part_id] = defn
+    return defn
+
+
+def invalidate_definitions() -> None:
+    """Drop the dynamic-definition cache (tests / catalog reload)."""
+    _DYNAMIC_DEFINITIONS.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,28 @@ _BRICK_LENGTH_LDU = {
 }
 
 
+def _require_uniform_width(palette: Iterable[str]) -> None:
+    """All bricks in one wall palette must be the same width (depth in studs).
+
+    Mixing widths puts a 1-wide brick's receptor row (z=0) between a 2-wide
+    row's stud columns (z=±10) — the bricks rest on each other but nothing
+    clutches. The old AABB support check used to silently accept this.
+    """
+    s = _server()
+    widths = set()
+    for pid in palette:
+        part = s.PART_INDEX.get(pid)
+        if part is not None:
+            widths.add(min(part.width, part.depth))
+    if len(widths) > 1:
+        raise ValueError(
+            f"palette {list(palette)} mixes brick widths {sorted(widths)} LDU — "
+            "a wall palette must be uniform-width or the rows can't clutch. "
+            f"Use all 1-wide ({PALETTE_DEFAULT_BODY}) or all 2-wide "
+            f"({PALETTE_TWO_STUD_WALL}) bricks."
+        )
+
+
 def _server():
     from lego_mcp import server
     return server
@@ -237,6 +259,7 @@ def build_wall_segment(start_x: float, start_z: float,
         raise ValueError("bond must be 'running'/'stretcher' or 'stack'")
 
     pal = palette or list(PALETTE_DEFAULT_BODY)
+    _require_uniform_width(pal)
 
     if strict_grid:
         for v, name in ((start_x, "start_x"), (start_z, "start_z"),
@@ -995,7 +1018,10 @@ def place_on_top(base_instance_id: str, new_part_id: str,
         if message.startswith("strict: "):
             message = message.removeprefix("strict: ")
         raise ValueError(f"Cannot place: {message}") from exc
-    return {"ok": True, "instance_id": r["instance_id"], "position": [new_x, new_y, new_z]}
+    return {"ok": True, "instance_id": r["instance_id"],
+            "position": [new_x, new_y, new_z],
+            "connectivity": r.get("connectivity"),
+            "warnings": r.get("warnings", [])}
 
 
 def place_next_to(reference_instance_id: str, new_part_id: str,
@@ -1032,40 +1058,126 @@ def place_next_to(reference_instance_id: str, new_part_id: str,
     else:
         raise ValueError(f"side must be north/south/east/west, got {side!r}")
     r = s.add_part(new_part_id, color, new_x, new_y, new_z, rotation=rotation)
-    return {"ok": True, "instance_id": r["instance_id"], "position": [new_x, new_y, new_z]}
+    return {"ok": True, "instance_id": r["instance_id"],
+            "position": [new_x, new_y, new_z],
+            "connectivity": r.get("connectivity"),
+            "warnings": r.get("warnings", [])}
 
 
-def find_valid_placements(part_id: str, near_part_id: str) -> dict[str, Any]:
-    """List every way `part_id` can connect to the in-model part `near_part_id`."""
+_Y_ORDER = ("identity", "rot90y", "rot180y", "rot270y")
+
+# token -> stored placement. Tokens stay valid across calls so the LLM can
+# compare placements around several anchors before choosing one.
+_PLACEMENT_TOKENS: dict[str, dict[str, Any]] = {}
+_PLACEMENT_SEQ = 0
+_PLACEMENT_CACHE_MAX = 1000
+
+
+def _compose_y_rotation(a: str, b: str) -> str | None:
+    """Compose two named Y-rotations; None if either isn't a Y-rotation."""
+    if a not in _Y_ORDER or b not in _Y_ORDER:
+        return None
+    return _Y_ORDER[(_Y_ORDER.index(a) + _Y_ORDER.index(b)) % 4]
+
+
+def find_valid_placements(part_id: str, near_part_id: str,
+                           limit: int = 20) -> dict[str, Any]:
+    """List the ways `part_id` can REALLY connect to the in-model part
+    `near_part_id` — both sitting on top of it and hanging underneath it.
+
+    Placements that would collide with any other part already in the model
+    are filtered out. Results are sorted by studs engaged (most first) and
+    each carries a `token`: pass it to `add_part_at_placement(token, color)`
+    to place the part exactly there without doing coordinate math.
+    """
     from lego_mcp.connections import find_connections
+    from lego_mcp.connectors import _apply_rotation
+    global _PLACEMENT_SEQ
     s = _server()
     a_inst = s.STATE.parts.get(near_part_id)
     if a_inst is None:
         raise ValueError(f"No part with instance_id={near_part_id!r}")
+    if a_inst.rotation not in _Y_ORDER:
+        return {"ok": False,
+                "reason": (f"anchor {near_part_id} has rotation "
+                            f"{a_inst.rotation!r}; placement search only "
+                            "supports Y-rotated anchors")}
     a = s.PART_INDEX[a_inst.part_id]
     b = s._require_part(part_id)
     r = find_connections(a, b)
-    # Translate from "relative to A at origin" to "absolute world coords".
-    abs_placements = []
-    seen_positions: set[tuple[int, int, int]] = set()
-    for p in r["b_on_a_placements"]:
-        key = (
-            int(round(a_inst.x + p["x"])),
-            int(round(a_inst.y + p["y"])),
-            int(round(a_inst.z + p["z"])),
-        )
-        if key in seen_positions:
-            continue
-        seen_positions.add(key)
-        abs_placements.append({**p,
-                                "world_x": a_inst.x + p["x"],
-                                "world_y": a_inst.y + p["y"],
-                                "world_z": a_inst.z + p["z"]})
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, str]] = set()
+    filtered_colliding = 0
+    for plist, direction in ((r["b_on_a_placements"], "on_top"),
+                              (r["a_on_b_placements"], "underneath")):
+        for p in plist:
+            off = _apply_rotation(a_inst.rotation, (p["x"], p["y"], p["z"]))
+            wx, wy, wz = a_inst.x + off[0], a_inst.y + off[1], a_inst.z + off[2]
+            wrot = _compose_y_rotation(a_inst.rotation, p["rotation"])
+            if wrot is None:
+                continue
+            # A square part rotated in place is the same physical outcome —
+            # collapse to one entry.
+            rot_key = "any" if b.width == b.depth else wrot
+            key = (int(round(wx)), int(round(wy)), int(round(wz)), rot_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            cand = s.PartInstance(
+                instance_id="_probe", part_id=b.part_id, color=0,
+                x=wx, y=wy, z=wz, rotation=wrot,
+            )
+            if s._collisions_for(cand, b):
+                filtered_colliding += 1
+                continue
+            candidates.append({
+                "x": wx, "y": wy, "z": wz, "rotation": wrot,
+                "studs_matched": p["studs_matched"],
+                "direction": direction,
+            })
+    candidates.sort(key=lambda c: (-c["studs_matched"], c["y"], c["x"], c["z"]))
+    candidates = candidates[:limit]
+    for c in candidates:
+        _PLACEMENT_SEQ += 1
+        token = f"pl{_PLACEMENT_SEQ}"
+        _PLACEMENT_TOKENS[token] = {"part_id": b.part_id, "x": c["x"],
+                                     "y": c["y"], "z": c["z"],
+                                     "rotation": c["rotation"]}
+        c["token"] = token
+    while len(_PLACEMENT_TOKENS) > _PLACEMENT_CACHE_MAX:
+        _PLACEMENT_TOKENS.pop(next(iter(_PLACEMENT_TOKENS)))
     return {"part_id": part_id, "near_part_id": near_part_id,
-            "placements": abs_placements,
-            "count": len(abs_placements),
-            "raw_count": len(r["b_on_a_placements"]),
-            "deduped_by_world_position": True}
+            "placements": candidates,
+            "count": len(candidates),
+            "filtered_out_colliding": filtered_colliding,
+            "note": ("Use add_part_at_placement(token, color) to place one. "
+                     "'underneath' placements hang the part below the anchor — "
+                     "that is a real LEGO connection too.")}
+
+
+def add_part_at_placement(token: str,
+                           color: str | int = "light_bluish_gray",
+                           ) -> dict[str, Any]:
+    """Place a part at a placement returned by find_valid_placements.
+
+    The placement is applied with strict checking, so it is guaranteed to
+    really connect and not collide (the model may have changed since the
+    search — if so, this fails loudly instead of placing a broken part).
+    """
+    s = _server()
+    rec = _PLACEMENT_TOKENS.get(token)
+    if rec is None:
+        raise ValueError(
+            f"Unknown or expired placement token {token!r}. "
+            "Call find_valid_placements again and use a fresh token.")
+    r = s.add_part(rec["part_id"], color, rec["x"], rec["y"], rec["z"],
+                   rotation=rec["rotation"], strict=True)
+    return {"ok": True, "instance_id": r["instance_id"],
+            "position": [rec["x"], rec["y"], rec["z"]],
+            "rotation": rec["rotation"],
+            "connectivity": r.get("connectivity"),
+            "warnings": r.get("warnings", [])}
 
 
 def suggest_next_brick_for_wall(subassembly: str) -> dict[str, Any]:
@@ -1102,6 +1214,7 @@ def register_helpers(mcp) -> None:
     mcp.tool()(place_on_top)
     mcp.tool()(place_next_to)
     mcp.tool()(find_valid_placements)
+    mcp.tool()(add_part_at_placement)
     mcp.tool()(suggest_next_brick_for_wall)
 
 
@@ -1122,7 +1235,9 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
         bond_key = "stack"
     if bond_key not in ("running", "stack"):
         raise ValueError("bond must be 'running'/'stretcher' or 'stack'")
-    pal = ["3001", "3004"] if brick_part == "3001" else list(PALETTE_DEFAULT_BODY)
+    # NOTE: the palette must be width-uniform — a 1-wide filler brick on a
+    # 2-wide row rests between the stud columns and never clutches.
+    pal = list(PALETTE_TWO_STUD_WALL) if brick_part == "3001" else list(PALETTE_DEFAULT_BODY)
     if abs(x1 - x0) >= abs(z1 - z0):
         sx = min(x0, x1) + inset_ends
         ex = max(x0, x1) - inset_ends

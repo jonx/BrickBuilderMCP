@@ -38,7 +38,7 @@ def test_strict_add_rejects_collision():
 
 def test_strict_add_rejects_floating():
     server.create_model()
-    with pytest.raises(ValueError, match="strict.*support"):
+    with pytest.raises(ValueError, match="strict.*stud connection"):
         server.add_part("3001", "red", 0, -200, 0, strict=True)
 
 
@@ -109,5 +109,5 @@ def test_strict_rejects_too_small_overlap():
     # AABB upper: x in [30, 110]. XZ overlap with lower: x [30,40], z [-20,20]
     # = 10 * 40 = 400 LDU². Exactly one stud — should be allowed barely.
     # Move it further so overlap < 400.
-    with pytest.raises(ValueError, match="strict.*support"):
+    with pytest.raises(ValueError, match="strict.*stud connection"):
         server.add_part("3001", "blue", 75, -24, 0, strict=True)

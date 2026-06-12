@@ -25,9 +25,38 @@ COORDS_BLURB = """\
 **Rotations** are named, not matrices: identity, rot90y, rot180y, rot270y, rot90x, rot90z.
 """
 
+CONNECTIONS_BLURB = """\
+**How LEGO connections work here (read this — it is the #1 source of broken models)**:
+
+- A connection is a **stud mating with a receiver**: the studs on a part's TOP
+  face plug into the receivers on the BOTTOM face of the part above. Nothing
+  else connects. Two bricks merely touching (side by side, or resting without
+  stud alignment) are NOT connected.
+- Studs sit on a **20 LDU grid**. Two parts mate only when their stud grids
+  line up exactly — a half-stud (10 LDU) offset means ZERO clutch, even though
+  the bricks visually rest on each other. Half-stud offsets are only legal
+  through jumper plates.
+- Connections work in **both directions**: a part can sit on studs below it
+  *or hang from receivers above it* (e.g. a tile or plate attached under an
+  overhang). Building downward is fine — what matters is that every part
+  reaches the ground through a chain of real stud connections.
+- A **1-wide part centered on a 2-wide part does not connect** — its receiver
+  row (z=0) lies between the 2-wide part's stud columns (z=±10). Offset it by
+  one half of the base's width so the grids align.
+- **Never trust raw coordinates you computed in your head.** Use
+  `find_valid_placements(part_id, near_id)` → pick a placement →
+  `add_part_at_placement(token, color)`; or `place_on_top`. These are
+  guaranteed to mate.
+- Every `add_part` / `move_part` / `rotate_part` result includes
+  `connectivity` (which parts it mates with, studs engaged) and `warnings`.
+  **A FLOATING or COLLISION warning means the model is already broken — fix
+  it immediately, never build on top of it.**
+"""
+
 WORKFLOW_BLURB = """\
 **Working loop** (do this each time you add 5-50 parts):
-1. `add_part` / helpers like `build_wall`.
+1. `add_part` / helpers like `build_wall`. **Check the `warnings` in every
+   result** — a FLOATING/COLLISION warning must be fixed before the next part.
 2. `validate_model` — fix any collisions/unknowns the report flags.
 3. `render_model` — look at the result; check proportions, alignment, colors.
    Use `render_model(color_mode="instance")` or `"row"` when debugging brick layout.
@@ -45,7 +74,7 @@ TECHNIQUES_BLURB = """\
 
 - **Running bond (stretcher)**: each brick row offset by half a brick from the row below — distributes load, looks like real masonry. Use `build_wall(..., bond="running")`.
 - **Bonded rectilinear perimeters**: use `build_perimeter(points=[...])` for footprints from images/plans/models. Use `build_room(...)` only as the rectangle shortcut. Corners alternate direction by row; use `palette=["3001"]` when you specifically want 2x4-only walls and the dimensions fit.
-- **Floors + walls compose automatically**: `build_floor(...)` defaults to ground level, and wall helpers with omitted `base_y` stack on the highest overlapping support. Pass `base_y` only when you deliberately need a custom elevation.
+- **Floors + walls compose automatically**: `build_floor(...)` defaults to ground level, and wall helpers with omitted `base_y` stack on the highest overlapping support. Pass `base_y` only when you deliberately need a custom elevation. **Run walls along stud rows** (odd multiples of 10 LDU on a floor/baseplate grid, e.g. z=10, not z=0): a wall on the floor's edge line sits between stud columns and can't clutch.
 - **Openings and arches**: use `build_wall_with_openings(...)` for straight walls with rectangular, round-arch, or lancet spans. Use `x_min/x_max` or `z_min/z_max` for world-coordinate openings. Keep opening edges on the stud grid and leave at least two studs of pier between adjacent openings.
 - **Roofs**: use `build_stepped_gable_roof(...)` for nave/house roofs and `build_stepped_pyramid_roof(...)` for towers. The default parts are connector-aware, so validation can prove the roof is supported.
 - **English bond**: alternating header (short side facing out) and stretcher rows. Use for thick, sturdy walls.
@@ -81,6 +110,10 @@ def register_resources(mcp) -> None:
     def workflow_resource() -> str:
         return "# Recommended build workflow\n\n" + WORKFLOW_BLURB
 
+    @mcp.resource("lego://connections", mime_type="text/markdown")
+    def connections_resource() -> str:
+        return "# How LEGO connections work\n\n" + CONNECTIONS_BLURB
+
     @mcp.resource("lego://model/current", mime_type="application/json")
     def current_model_resource() -> str:
         import json
@@ -109,6 +142,8 @@ You're driving the **LegoMCP** server. Below is the full toolbox + the workflow 
 
 {COORDS_BLURB}
 
+{CONNECTIONS_BLURB}
+
 ## Building tools (in order of preference)
 
 **High-level helpers** — use these first; they handle stagger / corners / fits:
@@ -124,8 +159,12 @@ You're driving the **LegoMCP** server. Below is the full toolbox + the workflow 
 - `parts_that_mount_on(part_id, limit=20)` — reverse search: "what can sit on top of THIS?" Indexed across the full catalog.
 - `find_connections(a, b)` — every valid placement of B-on-A and A-on-B.
 
+**Connection-guaranteed placement (preferred over raw coordinates)**:
+- `find_valid_placements(part_id, near_instance_id)` — lists positions where the part REALLY connects to that anchor, both on top and hanging underneath, pre-filtered against collisions. Each entry has a `token`.
+- `add_part_at_placement(token, color)` — place the part exactly there, strict-checked. Zero coordinate math, zero floating parts.
+
 **Raw / debug** (avoid unless helpers don't fit):
-- `add_part(part_id, color, x, y, z, rotation, strict=False)` — explicit placement. `strict=True` rejects collisions/floating.
+- `add_part(part_id, color, x, y, z, rotation, strict=False)` — explicit placement. `strict=True` rejects collisions and unconnected placements. Every result reports `connectivity` + `warnings` — heed them.
 
 ## See what you built — IMPORTANT
 
@@ -199,6 +238,8 @@ You're now driving the LegoMCP server. Build target: **{goal}** at **{scale}** s
 
 {COORDS_BLURB}
 
+{CONNECTIONS_BLURB}
+
 {WORKFLOW_BLURB}
 
 {TECHNIQUES_BLURB}
@@ -234,6 +275,8 @@ Before placing any brick:
 
 {COORDS_BLURB}
 
+{CONNECTIONS_BLURB}
+
 {WORKFLOW_BLURB}
 
 {TECHNIQUES_BLURB}
@@ -260,6 +303,8 @@ You'll be building from a reference image the user uploads.
 
 {COORDS_BLURB}
 
+{CONNECTIONS_BLURB}
+
 {WORKFLOW_BLURB}
 
 After each render, compare to the reference image and adjust. Don't claim it's "done" until the silhouette and key features visibly match.
@@ -282,6 +327,8 @@ A user has handed you an existing model at `{path}`. Your job is to improve it.
 5. `save_checkpoint("before_improvements")` before you start changing things.
 
 {COORDS_BLURB}
+
+{CONNECTIONS_BLURB}
 
 {TECHNIQUES_BLURB}
 """)]

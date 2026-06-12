@@ -148,6 +148,10 @@ def _ensure_library_loaded() -> None:
         return
     _LIBRARY_LOADED = True
     PART_INDEX = load_library_index()
+    # Connector definitions are derived from Part records; drop any built
+    # against the builtin fallback catalog.
+    from lego_mcp.connectors import invalidate_definitions
+    invalidate_definitions()
 
 
 def _record(op: Op) -> None:
@@ -245,42 +249,91 @@ def xz_overlap_area(a: tuple, b: tuple) -> float:
 
 GROUND_Y = 0.0          # LDU. The "ground plane" where unsupported parts can rest.
 SUPPORT_TOL = 0.5       # LDU. Vertical gap tolerance for considering "touching".
-# A real LEGO connection needs at least one stud's worth of overlap (the stud
-# is what mates with the part above's anti-stud). One stud's footprint = 20x20
-# LDU = 400 LDU². If the XZ-interface area is below this, the parts touch but
-# don't actually clutch — physically equivalent to a floating brick.
-MIN_SUPPORT_AREA = 400.0
 
 
-def _check_supported(inst_aabb: tuple, neighbor_aabbs: list[tuple]) -> bool:
-    """True if the part has any valid LEGO connection.
+def _connection_report(inst: PartInstance, part: Part) -> dict[str, Any]:
+    """Stud-mating + grounding report for one part instance vs the rest of
+    the model. Drives strict placement and the per-mutation feedback that
+    add_part / move_part / rotate_part return.
 
-    A connection counts as valid if there's at least one stud's worth of
-    XZ overlap (>= MIN_SUPPORT_AREA) at the part's TOP face (held from above)
-    OR its BOTTOM face (sits on something below). Or the part is grounded.
-
-    Note: this is a local connectivity check, not a global reachability one.
-    A small connected island floating in space won't trip the floating-part
-    detector because each of its parts is locally "connected" to its neighbors.
-    A full reachability check (does this connected component touch the ground?)
-    is a future improvement — for now, the LLM can spot disconnected islands
-    by render + spatial reasoning.
+    A part counts as connected when it is grounded (bottom face on the
+    table) or at least one of its studs/receivers mates with a neighbor —
+    in either direction: sitting on studs below or hanging from receivers
+    above are both real LEGO connections.
     """
-    (_, inst_top_y, _), (_, inst_bottom_y, _) = inst_aabb
-    if abs(inst_bottom_y - GROUND_Y) < SUPPORT_TOL:
-        return True
-    for n in neighbor_aabbs:
-        (_, n_top_y, _), (_, n_bottom_y, _) = n
-        # Connection from below: neighbor's top face matches our bottom face.
-        if (abs(n_top_y - inst_bottom_y) < SUPPORT_TOL
-                and xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA):
-            return True
-        # Connection from above (SNOT / hanging brick): neighbor's bottom face
-        # matches our top face.
-        if (abs(n_bottom_y - inst_top_y) < SUPPORT_TOL
-                and xz_overlap_area(inst_aabb, n) >= MIN_SUPPORT_AREA):
-            return True
-    return False
+    from lego_mcp.connection_graph import CONNECTION_TOL, _complementary
+    from lego_mcp.connectors import definition_for, world_connectors
+
+    ab = part_aabb_world(inst, part)
+    grounded = abs(ab[1][1] - GROUND_Y) < SUPPORT_TOL   # max y == bottom (-Y is up)
+
+    def cell(wc) -> tuple[int, int, int]:
+        return (int(round(wc.x / CONNECTION_TOL)),
+                int(round(wc.y / CONNECTION_TOL)),
+                int(round(wc.z / CONNECTION_TOL)))
+
+    connections: dict[str, int] = {}
+    defn = definition_for(inst.part_id)
+    if defn is not None:
+        cand_by_cell: dict[tuple[int, int, int], set] = {}
+        for wc in world_connectors(inst.instance_id, defn,
+                                   inst.x, inst.y, inst.z, inst.rotation):
+            cand_by_cell.setdefault(cell(wc), set()).add(wc.type)
+        for other in STATE.parts.values():
+            if other.instance_id == inst.instance_id:
+                continue
+            odefn = definition_for(other.part_id)
+            if odefn is None:
+                continue
+            n = 0
+            for owc in world_connectors(other.instance_id, odefn,
+                                        other.x, other.y, other.z, other.rotation):
+                types = cand_by_cell.get(cell(owc))
+                if types and any(_complementary(owc.type, t) for t in types):
+                    n += 1
+            if n:
+                connections[other.instance_id] = n
+    return {
+        "grounded": grounded,
+        "connected_to": connections,
+        "studs_engaged": sum(connections.values()),
+        "is_connected": grounded or bool(connections),
+    }
+
+
+def _collisions_for(inst: PartInstance, part: Part) -> list[str]:
+    """Instance ids whose AABB overlaps this instance's AABB."""
+    ab = part_aabb_world(inst, part)
+    out: list[str] = []
+    for other in STATE.parts.values():
+        if other.instance_id == inst.instance_id:
+            continue
+        other_part = PART_INDEX.get(other.part_id)
+        if other_part is None:
+            continue
+        if aabbs_overlap(ab, part_aabb_world(other, other_part)):
+            out.append(other.instance_id)
+    return out
+
+
+def _placement_feedback(inst: PartInstance, part: Part) -> dict[str, Any]:
+    """connectivity + collisions + human-readable warnings for a mutation
+    result. Shared by add_part / move_part / rotate_part."""
+    report = _connection_report(inst, part)
+    collisions = _collisions_for(inst, part)
+    warnings: list[str] = []
+    if collisions:
+        warnings.append(
+            f"COLLISION with {', '.join(collisions)} — parts overlap; "
+            "move or remove one of them."
+        )
+    if not report["is_connected"]:
+        warnings.append(
+            "FLOATING: no stud connection and not on the ground. Connect it "
+            "to studs below or hang it from receivers above — use "
+            "find_valid_placements / place_on_top instead of raw coordinates."
+        )
+    return {"connectivity": report, "collisions": collisions, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -561,10 +614,15 @@ def add_part(
         x, y, z: Position in LDU. Origin = center of part's bottom face. **-Y is up.**
         rotation: One of identity, rot90y, rot180y, rot270y, rot90x, rot90z.
         strict: If True, REJECT the placement when it would overlap an existing
-            part or have no support below (no baseplate / brick beneath, no
-            ground at y=0). Use this when you want the model to be physically
-            buildable as you go, instead of catching problems later in
-            validate_model.
+            part or has no real stud connection (no studs below it to sit on,
+            no receivers above it to hang from, and not on the ground at y=0).
+            Use this when you want the model to be physically buildable as you
+            go, instead of catching problems later in validate_model.
+
+    The result always includes `connectivity` (which parts this one mates
+    with and how many studs engage), `collisions`, and `warnings`. A
+    placement that reports FLOATING or COLLISION will fail validate_model —
+    fix it immediately rather than building on top of it.
     """
     part = _require_part(part_id)
     cid = resolve_color(color)
@@ -574,24 +632,20 @@ def add_part(
         x=float(x), y=float(y), z=float(z), rotation=rotation.lower(),
         subassembly=STATE.current_subassembly,
     )
+    feedback = _placement_feedback(candidate, part)
     if strict:
-        cand_aabb = part_aabb_world(candidate, part)
-        neighbor_aabbs: list[tuple] = []
-        for other in STATE.parts.values():
-            other_part = PART_INDEX.get(other.part_id)
-            if other_part is None:
-                continue
-            other_aabb = part_aabb_world(other, other_part)
-            if aabbs_overlap(cand_aabb, other_aabb):
-                raise ValueError(
-                    f"strict: would collide with instance {other.instance_id} "
-                    f"({other.part_id} at {other.x},{other.y},{other.z})"
-                )
-            neighbor_aabbs.append(other_aabb)
-        if not _check_supported(cand_aabb, neighbor_aabbs):
+        if feedback["collisions"]:
+            other = STATE.parts[feedback["collisions"][0]]
             raise ValueError(
-                f"strict: no support below at ({x},{y},{z}). Need a baseplate / "
-                f"brick at top face y={cand_aabb[1][1]}, or y must be at ground (0)."
+                f"strict: would collide with instance {other.instance_id} "
+                f"({other.part_id} at {other.x},{other.y},{other.z})"
+            )
+        if not feedback["connectivity"]["is_connected"]:
+            raise ValueError(
+                f"strict: no stud connection at ({x},{y},{z}). The part needs "
+                "studs below to sit on, receivers above to hang from, or the "
+                "ground at y=0. Use find_valid_placements to list positions "
+                "that really connect."
             )
     inst_id = STATE.new_id()
     candidate.instance_id = inst_id
@@ -601,7 +655,8 @@ def add_part(
     if not STATE.builder_mode:
         STATE.built.add(inst_id)
     _record(Op("add", inst_id, {"inst": deepcopy(candidate)}))
-    return {"ok": True, "instance_id": inst_id, "part": _inst_dict(candidate)}
+    return {"ok": True, "instance_id": inst_id, "part": _inst_dict(candidate),
+            **feedback}
 
 
 @mcp.tool()
@@ -617,7 +672,8 @@ def remove_part(instance_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def move_part(instance_id: str, x: float, y: float, z: float) -> dict[str, Any]:
-    """Reposition a part to a new (x,y,z) in LDU. Undoable."""
+    """Reposition a part to a new (x,y,z) in LDU. Undoable. The result
+    reports the part's connectivity at the new position — heed any warnings."""
     inst = STATE.parts.get(instance_id)
     if inst is None:
         raise ValueError(f"No part with instance_id={instance_id!r}")
@@ -625,12 +681,15 @@ def move_part(instance_id: str, x: float, y: float, z: float) -> dict[str, Any]:
     new_pos = (float(x), float(y), float(z))
     inst.x, inst.y, inst.z = new_pos
     _record(Op("move", instance_id, {"old_pos": old_pos, "new_pos": new_pos}))
-    return {"ok": True, "part": _inst_dict(inst)}
+    part = PART_INDEX.get(inst.part_id)
+    feedback = _placement_feedback(inst, part) if part else {}
+    return {"ok": True, "part": _inst_dict(inst), **feedback}
 
 
 @mcp.tool()
 def rotate_part(instance_id: str, rotation: str) -> dict[str, Any]:
-    """Change a part's rotation. Undoable."""
+    """Change a part's rotation. Undoable. The result reports the part's
+    connectivity in the new orientation — heed any warnings."""
     inst = STATE.parts.get(instance_id)
     if inst is None:
         raise ValueError(f"No part with instance_id={instance_id!r}")
@@ -639,7 +698,9 @@ def rotate_part(instance_id: str, rotation: str) -> dict[str, Any]:
     new_rot = rotation.lower()
     inst.rotation = new_rot
     _record(Op("rotate", instance_id, {"old_rot": old_rot, "new_rot": new_rot}))
-    return {"ok": True, "part": _inst_dict(inst)}
+    part = PART_INDEX.get(inst.part_id)
+    feedback = _placement_feedback(inst, part) if part else {}
+    return {"ok": True, "part": _inst_dict(inst), **feedback}
 
 
 @mcp.tool()
@@ -1304,7 +1365,9 @@ def _suggest_for_floating(inst) -> str:
     nearest = min(plate_y_options, key=lambda y: abs(y - inst.y))
     if abs(nearest - inst.y) < 30 and nearest != inst.y:
         return f"Move part {inst.instance_id} from y={inst.y} to y={nearest} (nearest stack-aligned Y)."
-    return f"Place a supporting brick directly below part {inst.instance_id}."
+    return (f"Connect part {inst.instance_id} to studs below or hang it from "
+            "receivers above — find_valid_placements(part_id, neighbor_id) "
+            "lists positions that really mate.")
 
 
 # ---------------------------------------------------------------------------

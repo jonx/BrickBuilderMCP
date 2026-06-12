@@ -38,9 +38,9 @@ def _complementary(t1: ConnectorType, t2: ConnectorType) -> bool:
 
 
 def collect_world_connectors(parts) -> dict[str, list[WorldConnector]]:
-    """For every part instance with a supported definition, project its
-    connectors to world coords. Parts without a PartDefinition (e.g. tiles,
-    slopes, baseplates) are excluded — those go through the AABB path."""
+    """For every known part instance, project its connectors to world coords.
+    Definitions are derived from real catalog geometry (see
+    `connectors.definition_for`); only unknown part_ids are excluded."""
     out: dict[str, list[WorldConnector]] = {}
     for inst in parts.values():
         defn = definition_for(inst.part_id)
@@ -113,43 +113,25 @@ def build_graph(parts) -> tuple[dict[str, set[str]], list[ConnectionEdge]]:
 
 
 def find_anchors(parts) -> set[str]:
-    """A part is an anchor (grounded) if:
-    - its bottom face is at y=0 (sitting on the table), OR
-    - it sits on top of a part that IS itself grounded AND whose footprint
-      covers the part's XZ position. The typical case: a brick at y=-4 over
-      a baseplate at y=0. (We approximate "footprint covers" by AABB XZ.)
+    """A part is an anchor (grounded) iff its bottom face rests on the table
+    (world y ~ 0). Everything else must reach an anchor through real
+    stud-receptor edges — in either direction: stacking on top of a grounded
+    chain and hanging underneath one are both legitimate.
+
+    Note there is deliberately NO "sits on a grounded part's top face" AABB
+    fallback here: resting on a brick without stud mating (e.g. half a stud
+    off) is not a LEGO connection and must be reported, not blessed.
     """
     from lego_mcp.server import PART_INDEX, part_aabb_world
-    grounded_anchors: list[tuple[str, tuple]] = []   # (id, AABB)
     anchors: set[str] = set()
-
-    # Pass 1: direct ground contact (y ~ 0).
     for inst in parts.values():
-        if abs(inst.y) < GROUND_Y_TOL:
-            anchors.add(inst.instance_id)
-            part = PART_INDEX.get(inst.part_id)
-            if part is not None:
-                grounded_anchors.append((inst.instance_id, part_aabb_world(inst, part)))
-
-    # Pass 2: parts sitting on the top face of any directly-grounded part.
-    for inst in parts.values():
-        if inst.instance_id in anchors:
-            continue
         part = PART_INDEX.get(inst.part_id)
-        if part is None:
-            continue
-        ab = part_aabb_world(inst, part)
-        bottom_y = ab[1][1]
-        for (aid, anchor_ab) in grounded_anchors:
-            anchor_top_y = anchor_ab[0][1]      # min y == top in our convention
-            if abs(anchor_top_y - bottom_y) > GROUND_Y_TOL:
-                continue
-            # XZ overlap > 0 means the part stands on this grounded anchor.
-            dx = min(ab[1][0], anchor_ab[1][0]) - max(ab[0][0], anchor_ab[0][0])
-            dz = min(ab[1][2], anchor_ab[1][2]) - max(ab[0][2], anchor_ab[0][2])
-            if dx > 0 and dz > 0:
-                anchors.add(inst.instance_id)
-                break
+        if part is not None:
+            bottom_y = part_aabb_world(inst, part)[1][1]   # max y == bottom (-Y is up)
+        else:
+            bottom_y = inst.y
+        if abs(bottom_y) < GROUND_Y_TOL:
+            anchors.add(inst.instance_id)
     return anchors
 
 

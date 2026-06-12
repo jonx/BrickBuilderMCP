@@ -4,7 +4,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **build
 
 ![A colorful bonded room on a tan baseplate, each brick a distinct color to show the running-bond stagger and 2x2 corner columns](docs/images/bonded_room.png)
 
-Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets ~50 semantic tools, 6 prompts, and 4 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
+Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets ~50 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
 > **Status: very early days.** The pipeline runs end-to-end — install, talk to Claude, get an exportable `.ldr` — and the tests pass, but please calibrate your expectations: **this project is just getting started.**
 >
@@ -54,9 +54,9 @@ Letting an LLM drive a CAD app via screen automation fails — too many micro-ac
 
 The toolchain enforces these so what the LLM exports is actually buildable:
 
-1. **Connection rule** — every part either sits on the ground (y ≈ 0) or has at least one stud-receptor mating with a part directly above or below. Anything else is reported as `floating`.
-2. **Anchored rule** — connected islands must reach the ground via a chain of connections. A "tower" whose bricks touch each other but the whole thing levitates is reported as `unanchored`.
-3. **No overlap** — bricks must not occupy the same AABB. `add_part(strict=True)` rejects overlapping placements at insertion time.
+1. **Connection rule** — every part either sits on the ground (y ≈ 0) or has at least one stud-receptor mating with a part directly above or below. Both directions are real connections: sitting on studs below **or hanging from receivers above** (building downward is fine). Merely resting on another brick without stud alignment — e.g. half a stud off, or a 1-wide brick centered on a 2-wide one — is NOT a connection and is reported as `floating`. Enforced for **every part in the catalog**, not a hardcoded subset.
+2. **Anchored rule** — connected islands must reach the ground via a chain of stud connections (in any direction). A "tower" whose bricks touch each other but the whole thing levitates is reported as `unanchored`.
+3. **No overlap** — bricks must not occupy the same AABB. `add_part(strict=True)` rejects overlapping and unconnected placements at insertion time, and **every `add_part`/`move_part`/`rotate_part` result carries a `connectivity` report + `warnings`** so problems surface immediately, not at the next `validate_model`.
 4. **Real geometry** — AABBs, stud positions, and dimensions come from actually-parsed LDraw `.dat` files (recursively through subparts and `stug-NxN` stud-group primitives). A "Brick 2x4" really is 80 LDU × 40 LDU × 24 LDU with 8 studs at the correct positions.
 
 ---
@@ -142,7 +142,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 ## The tools, grouped
 
-50 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → semantic placement → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
+~50 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
 
 ### Model state
 
@@ -155,10 +155,10 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 | Tool | What it does |
 |---|---|
-| `add_part(part_id, color, x, y, z, rotation, strict=False)` | Explicit placement. `strict=True` rejects overlap/floating at insertion. |
+| `add_part(part_id, color, x, y, z, rotation, strict=False)` | Explicit placement. `strict=True` rejects overlap and unconnected placements at insertion. Result includes `connectivity` (mated parts, studs engaged, grounded) + `warnings`. |
 | `remove_part(instance_id)` | Delete by id. |
-| `move_part(instance_id, x, y, z)` | Reposition. |
-| `rotate_part(instance_id, rotation)` | Change orientation. |
+| `move_part(instance_id, x, y, z)` | Reposition. Reports connectivity at the new position. |
+| `rotate_part(instance_id, rotation)` | Change orientation. Reports connectivity in the new orientation. |
 
 ### High-level helpers (preferred)
 
@@ -195,7 +195,8 @@ These encode real LEGO masonry/architecture techniques so the LLM doesn't have t
 | Tool | What it does |
 |---|---|
 | `find_connections(a, b, full_nesting_only=False, min_studs_matched=1)` | Every valid placement of B-on-A and A-on-B. |
-| `find_valid_placements(part_id, near_part_id)` | Same but in world coords relative to an existing part instance. |
+| `find_valid_placements(part_id, near_part_id, limit=20)` | World-coordinate placements that REALLY connect to an existing instance — on top **and hanging underneath**, pre-filtered against collisions with the rest of the model, sorted by studs engaged. Each entry carries a `token`. |
+| `add_part_at_placement(token, color)` | Place a part at a `find_valid_placements` result — strict-checked, zero coordinate math. The preferred way to attach a single part. |
 | `suggest_next_brick_for_wall(subassembly)` | Heuristic next-brick suggester (Phase 1 stub). |
 
 ### Subassemblies
