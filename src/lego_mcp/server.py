@@ -406,6 +406,29 @@ def parse_ldr_text(text: str) -> list[PartInstance]:
     main_name = order[0]
     block_names = set(blocks.keys())
 
+    def referenced_blocks(name: str) -> set[str]:
+        """Block references made directly by one MPD block."""
+        refs: set[str] = set()
+        for raw in blocks.get(name, []):
+            m = _TYPE1_RE.match(raw)
+            if not m:
+                continue
+            part_stem = Path(m.group(14).strip()).stem
+            if part_stem in block_names and part_stem != name:
+                refs.add(part_stem)
+        return refs
+
+    reachable_blocks: set[str] = set()
+
+    def mark_reachable(name: str) -> None:
+        if name in reachable_blocks:
+            return
+        reachable_blocks.add(name)
+        for ref in referenced_blocks(name):
+            mark_reachable(ref)
+
+    mark_reachable(main_name)
+
     def parse_block(name: str, transform: tuple[float, ...]) -> list[PartInstance]:
         """Recursively parse a block; sub-file refs to known blocks get expanded
         with composed transforms. Cycles are guarded by depth limit."""
@@ -447,11 +470,11 @@ def parse_ldr_text(text: str) -> list[PartInstance]:
 
     identity = (0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0)
     parts = parse_block(main_name, identity)
-    seen_subs = {p.subassembly for p in parts}
     # Also import parts from blocks that weren't referenced by main — tagged
-    # with their own block name. Keeps us forgiving with hand-edited MPDs.
+    # with their own block name. Keeps us forgiving with hand-edited MPDs, but
+    # avoids duplicating nested submodel definitions already expanded from main.
     for block_name in order[1:]:
-        if block_name in seen_subs:
+        if block_name in reachable_blocks:
             continue
         for p in parse_block(block_name, identity):
             p.subassembly = block_name

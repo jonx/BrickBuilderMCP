@@ -63,6 +63,7 @@ def invalidate() -> None:
 def parts_that_mount_on(target: Part, part_index: dict[str, Part],
                          limit: int = 20,
                          min_studs_matched: int = 1,
+                         exclude_keywords: tuple[str, ...] = (),
                          ) -> list[dict[str, Any]]:
     """Return up to `limit` parts that can sit on top of `target` with at
     least one stud-receptor mating.
@@ -89,6 +90,9 @@ def parts_that_mount_on(target: Part, part_index: dict[str, Part],
             continue
         for pid in pids:
             cand = part_index[pid]
+            haystack = f"{pid} {cand.name}".lower()
+            if any(keyword.lower() in haystack for keyword in exclude_keywords):
+                continue
             placements = find_placements_b_on_a(target, cand,
                                                  min_studs_matched=min_studs_matched)
             if not placements:

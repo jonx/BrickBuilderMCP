@@ -42,6 +42,55 @@ def _server():
     return server
 
 
+def _xz_overlap(a: tuple[float, float, float, float],
+                b: tuple[float, float, float, float]) -> float:
+    ax0, az0, ax1, az1 = a
+    bx0, bz0, bx1, bz1 = b
+    dx = min(ax1, bx1) - max(ax0, bx0)
+    dz = min(az1, bz1) - max(az0, bz0)
+    return max(0.0, dx) * max(0.0, dz)
+
+
+def _resolve_base_y(base_y: float | None,
+                    footprint: tuple[float, float, float, float]) -> float:
+    """Resolve semantic wall base height.
+
+    If the caller supplies `base_y`, keep it exactly. If omitted, place the
+    wall on the highest existing overlapping support, or on the ground when no
+    support exists. This lets `build_floor()` + wall helpers compose without
+    requiring users to remember plate/baseplate heights.
+    """
+    if base_y is not None:
+        return base_y
+    s = _server()
+    overlap_by_top: dict[float, float] = {}
+    for inst in s.STATE.parts.values():
+        part = s.PART_INDEX.get(inst.part_id)
+        if part is None:
+            continue
+        (xmin, ymin, zmin), (xmax, _ymax, zmax) = s.part_aabb_world(inst, part)
+        overlap = _xz_overlap(footprint, (xmin, zmin, xmax, zmax))
+        if overlap > 0.1:
+            overlap_by_top[ymin] = overlap_by_top.get(ymin, 0.0) + overlap
+    if not overlap_by_top:
+        return 0.0
+    # Prefer the broadest support surface, then the highest face among ties.
+    candidates = [(overlap, top_y) for top_y, overlap in overlap_by_top.items()]
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return candidates[0][1]
+
+
+def _line_footprint(start_x: float, start_z: float,
+                    end_x: float, end_z: float,
+                    pad: float = STUD) -> tuple[float, float, float, float]:
+    return (
+        min(start_x, end_x) - pad,
+        min(start_z, end_z) - pad,
+        max(start_x, end_x) + pad,
+        max(start_z, end_z) + pad,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Brick picker for a single row
 # ---------------------------------------------------------------------------
@@ -133,26 +182,28 @@ def _pick_brick_run_world(length_ldu: int, start_world: float, avoid_world_seams
 # ---------------------------------------------------------------------------
 
 def _place_row_x(x_start: float, z_center: float, y: float,
-                  plan: list[tuple[str, int]], color: str | int) -> list[str]:
+                  plan: list[tuple[str, int]], color: str | int,
+                  strict: bool = False) -> list[str]:
     """Place each brick in `plan` along +X starting at x_start, at z=z_center, y=y.
     Bricks are identity-oriented (long axis +X)."""
     s = _server()
     ids = []
     for pid, center_off in plan:
         cx = x_start + center_off
-        r = s.add_part(pid, color, cx, y, z_center, rotation="identity")
+        r = s.add_part(pid, color, cx, y, z_center, rotation="identity", strict=strict)
         ids.append(r["instance_id"])
     return ids
 
 
 def _place_row_z(x_center: float, z_start: float, y: float,
-                  plan: list[tuple[str, int]], color: str | int) -> list[str]:
+                  plan: list[tuple[str, int]], color: str | int,
+                  strict: bool = False) -> list[str]:
     """Same as _place_row_x but along +Z. Bricks are rot90y."""
     s = _server()
     ids = []
     for pid, center_off in plan:
         cz = z_start + center_off
-        r = s.add_part(pid, color, x_center, y, cz, rotation="rot90y")
+        r = s.add_part(pid, color, x_center, y, cz, rotation="rot90y", strict=strict)
         ids.append(r["instance_id"])
     return ids
 
@@ -166,7 +217,8 @@ def build_wall_segment(start_x: float, start_z: float,
                        height_rows: int = 5,
                        color: str | int = "light_bluish_gray",
                        palette: list[str] | None = None,
-                       base_y: float = -4,
+                       base_y: float | None = None,
+                       bond: str = "running",
                        strict_grid: bool = True,
                        ) -> dict[str, Any]:
     """Lay a straight wall from (start_x, start_z) to (end_x, end_z), staggered.
@@ -174,6 +226,16 @@ def build_wall_segment(start_x: float, start_z: float,
     Each row chooses a brick arrangement that doesn't share an internal seam
     X with the row below. Short bricks (1x2, 1x1) fill the ends as needed.
     """
+    auto_base_y = base_y is None
+    base_y = _resolve_base_y(base_y, _line_footprint(start_x, start_z, end_x, end_z))
+    bond_key = bond.strip().lower()
+    if bond_key in ("stretcher",):
+        bond_key = "running"
+    if bond_key in ("stacked",):
+        bond_key = "stack"
+    if bond_key not in ("running", "stack"):
+        raise ValueError("bond must be 'running'/'stretcher' or 'stack'")
+
     pal = palette or list(PALETTE_DEFAULT_BODY)
 
     if strict_grid:
@@ -215,13 +277,14 @@ def build_wall_segment(start_x: float, start_z: float,
             internal.add(cursor)
         internal.discard(length)
         if along_x:
-            placed.extend(_place_row_x(x0, z_center, y, plan, color))
+            placed.extend(_place_row_x(x0, z_center, y, plan, color, strict=auto_base_y))
         else:
-            placed.extend(_place_row_z(x_center, z0, y, plan, color))
+            placed.extend(_place_row_z(x_center, z0, y, plan, color, strict=auto_base_y))
         rows.append({"y": y, "bricks": len(plan), "seams": sorted(internal)})
-        prev_internal_seams = internal
+        prev_internal_seams = set() if bond_key == "stack" else internal
 
     return {"ok": True, "bricks_placed": len(placed), "rows": rows,
+            "bond": bond_key,
             "subassembly": _server().STATE.current_subassembly}
 
 
@@ -230,7 +293,7 @@ def build_wall_segment(start_x: float, start_z: float,
 # ---------------------------------------------------------------------------
 
 def build_corner(x: float, z: float, height_rows: int,
-                  base_y: float = -4,
+                  base_y: float | None = None,
                   color: str | int = "light_bluish_gray",
                   brick_part: str = "3004",
                   orientation: str = "alt_x_first",
@@ -245,6 +308,7 @@ def build_corner(x: float, z: float, height_rows: int,
     (see build_room).
     """
     s = _server()
+    base_y = _resolve_base_y(base_y, (x - STUD, z - STUD, x + STUD, z + STUD))
     ids = []
     for row in range(height_rows):
         y = base_y - row * BRICK_H
@@ -346,7 +410,8 @@ def _perimeter_edges(points: list[tuple[float, float]], thickness: float,
         length = end - start
         if length < thickness * 2 - 0.1:
             raise ValueError(
-                f"edge {i} is too short ({length:g} LDU) for {thickness:g} LDU thick bonded walls")
+                f"edge {i} is too short ({length:g} LDU) for {thickness:g} LDU thick bonded walls; "
+                f"needs at least {thickness * 2:g} LDU (2 x {thickness:g} LDU corner insets)")
         edges.append({
             "name": f"edge_{i}",
             "axis": axis,
@@ -365,7 +430,7 @@ def _perimeter_edges(points: list[tuple[float, float]], thickness: float,
 def build_perimeter(points: list,
                     height_rows: int = 5,
                     color: str | int = "light_bluish_gray",
-                    base_y: float = -4,
+                    base_y: float | None = None,
                     thickness_studs: int = 2,
                     palette: list[str] | None = None,
                     strict_grid: bool = True,
@@ -380,11 +445,16 @@ def build_perimeter(points: list,
         raise ValueError("height_rows must be positive")
     if thickness_studs not in (1, 2):
         raise ValueError("thickness_studs currently supports 1 or 2")
-    if abs(base_y - round(base_y / 4) * 4) > 0.1:
-        raise ValueError(f"base_y={base_y} not on quarter-plate grid")
-
+    auto_base_y = base_y is None
     pts = _normalize_points(points)
     _validate_perimeter_points(pts, strict_grid)
+    min_x = min(x for x, _ in pts)
+    max_x = max(x for x, _ in pts)
+    min_z = min(z for _, z in pts)
+    max_z = max(z for _, z in pts)
+    base_y = _resolve_base_y(base_y, (min_x, min_z, max_x, max_z))
+    if abs(base_y - round(base_y / 4) * 4) > 0.1:
+        raise ValueError(f"base_y={base_y} not on quarter-plate grid")
     thickness = thickness_studs * STUD
     pal = list(palette or (PALETTE_TWO_STUD_WALL if thickness_studs == 2 else PALETTE_DEFAULT_BODY))
     edges = _perimeter_edges(pts, thickness)
@@ -412,7 +482,10 @@ def build_perimeter(points: list,
         end = adjusted_endpoint(edge["end"], edge["end_corner"], owns_corner, False)
         length = int(round(end - start))
         if length <= 0:
-            raise ValueError(f"{edge['name']} row at y={y}: no span remains after corner inset")
+            raise ValueError(
+                f"{edge['name']} row at y={y}: no span remains after corner inset "
+                f"(start={start:g}, end={end:g}). Increase this edge beyond "
+                f"{thickness * 2:g} LDU or use a thinner wall.")
         picked = _pick_brick_run_world(length, start, prev_seams[edge["name"]], palette=pal)
         if picked is None:
             picked = _pick_brick_run_world(length, start, set(), palette=pal)
@@ -420,9 +493,9 @@ def build_perimeter(points: list,
             raise ValueError(f"{edge['name']} row at y={y}: no brick fit for length={length}")
         plan, world_seams = picked
         if edge["axis"] == "x":
-            ids = _place_row_x(start, edge["fixed"], y, plan, color)
+            ids = _place_row_x(start, edge["fixed"], y, plan, color, strict=auto_base_y)
         else:
-            ids = _place_row_z(edge["fixed"], start, y, plan, color)
+            ids = _place_row_z(edge["fixed"], start, y, plan, color, strict=auto_base_y)
         placed_total += len(ids)
         prev_seams[edge["name"]] = world_seams
         return {
@@ -465,7 +538,7 @@ def build_perimeter(points: list,
 def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
                 height_rows: int = 5,
                 color: str | int = "light_bluish_gray",
-                base_y: float = -4,
+                base_y: float | None = None,
                 strict_grid: bool = True,
                 palette: list[str] | None = None,
                 ) -> dict[str, Any]:
@@ -496,7 +569,7 @@ def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
 # ---------------------------------------------------------------------------
 
 def build_floor(x_min: float, z_min: float, x_max: float, z_max: float,
-                y: float = -4,
+                y: float = 0,
                 color: str | int = "light_bluish_gray",
                 part_id: str = "3022",
                 strict_grid: bool = True,
@@ -524,14 +597,55 @@ def build_floor(x_min: float, z_min: float, x_max: float, z_max: float,
 # Architectural generators: openings + stepped roofs
 # ---------------------------------------------------------------------------
 
-def _span_for_opening(opening: dict[str, Any], row: int) -> tuple[float, float] | None:
+def _opening_span(opening: dict[str, Any], row: int,
+                  axis: str, axis_start: float, axis_end: float
+                  ) -> tuple[float, float] | None:
     bottom = int(opening.get("bottom_row", 0))
     height = int(opening.get("height_rows", opening.get("height", 1)))
     if row < bottom or row >= bottom + height:
         return None
+    if height <= 0:
+        raise ValueError("opening height_rows must be positive")
 
-    width = float(opening.get("width", opening.get("width_ldu", STUD * 3)))
-    center = float(opening.get("center", opening.get("center_ldu", 0)))
+    local_keys = (("local_start", "local_end"), ("start", "end"))
+    world_keys = (("x_min", "x_max"), ("z_min", "z_max"))
+    local_span: tuple[float, float] | None = None
+    for a_key, b_key in local_keys:
+        if a_key in opening or b_key in opening:
+            if a_key not in opening or b_key not in opening:
+                raise ValueError(f"opening needs both {a_key!r} and {b_key!r}")
+            local_span = (float(opening[a_key]), float(opening[b_key]))
+            break
+    if local_span is None:
+        world_pair = world_keys[0] if axis == "x" else world_keys[1]
+        other_pair = world_keys[1] if axis == "x" else world_keys[0]
+        if world_pair[0] in opening or world_pair[1] in opening:
+            if world_pair[0] not in opening or world_pair[1] not in opening:
+                raise ValueError(f"opening needs both {world_pair[0]!r} and {world_pair[1]!r}")
+            local_span = (
+                float(opening[world_pair[0]]) - axis_start,
+                float(opening[world_pair[1]]) - axis_start,
+            )
+        elif other_pair[0] in opening or other_pair[1] in opening:
+            raise ValueError(
+                f"opening uses {other_pair[0]}/{other_pair[1]} but this wall runs along {axis.upper()}"
+            )
+
+    if local_span is not None:
+        span_start, span_end = sorted(local_span)
+        center = (span_start + span_end) / 2
+        width = span_end - span_start
+    elif "center" in opening or "center_ldu" in opening:
+        width = float(opening.get("width", opening.get("width_ldu", 0)))
+        if width <= 0:
+            raise ValueError("opening with center needs positive width/width_ldu")
+        center = float(opening.get("center", opening.get("center_ldu", 0)))
+    else:
+        raise ValueError(
+            "opening needs either center+width, start+end, local_start+local_end, "
+            "or world x_min/x_max / z_min/z_max"
+        )
+
     style = str(opening.get("style", "rect")).lower()
     rel = row - bottom
 
@@ -549,7 +663,11 @@ def _span_for_opening(opening: dict[str, Any], row: int) -> tuple[float, float] 
 
     if span_width < STUD * 2 - 0.1:
         return None
-    return center - span_width / 2, center + span_width / 2
+    a = axis_start + center - span_width / 2
+    b = axis_start + center + span_width / 2
+    if b <= axis_start + 0.1 or a >= axis_end - 0.1:
+        return None
+    return max(axis_start, a), min(axis_end, b)
 
 
 def _clip_intervals(start: float, end: float,
@@ -580,7 +698,7 @@ def build_wall_with_openings(start_x: float, start_z: float,
                              height_rows: int = 8,
                              color: str | int = "light_bluish_gray",
                              openings: list[dict[str, Any]] | None = None,
-                             base_y: float = -4,
+                             base_y: float | None = None,
                              thickness_studs: int = 2,
                              palette: list[str] | None = None,
                              glass_color: str | int = "trans_clear",
@@ -605,6 +723,8 @@ def build_wall_with_openings(start_x: float, start_z: float,
                         (end_x, "end_x"), (end_z, "end_z")):
             if abs(v - round(v / 10) * 10) > 0.1:
                 raise ValueError(f"{name}={v} not on half-stud grid")
+    auto_base_y = base_y is None
+    base_y = _resolve_base_y(base_y, _line_footprint(start_x, start_z, end_x, end_z))
     if abs(base_y - round(base_y / 4) * 4) > 0.1:
         raise ValueError(f"base_y={base_y} not on quarter-plate grid")
 
@@ -629,13 +749,12 @@ def build_wall_with_openings(start_x: float, start_z: float,
         y = base_y - row * BRICK_H
         active: list[tuple[float, float, str | int | None]] = []
         for opening in opening_specs:
-            span = _span_for_opening(opening, row)
+            span = _opening_span(opening, row, "x" if along_x else "z", axis_start, axis_end)
             if span is None:
                 continue
-            fill = opening.get("fill_color", glass_color)
-            a = axis_start + span[0]
-            b = axis_start + span[1]
-            active.append((max(axis_start, a), min(axis_end, b), fill))
+            role = str(opening.get("type", opening.get("kind", ""))).lower()
+            fill = opening.get("fill_color", None if role == "door" else glass_color)
+            active.append((span[0], span[1], fill))
 
         intervals = _clip_intervals(axis_start, axis_end, active)
         row_segments = []
@@ -652,9 +771,9 @@ def build_wall_with_openings(start_x: float, start_z: float,
                 raise ValueError(f"row {row}: no brick fit for span length={span_len}")
             plan, seams = picked
             if along_x:
-                ids = _place_row_x(a, fixed, y, plan, material_color)
+                ids = _place_row_x(a, fixed, y, plan, material_color, strict=auto_base_y)
             else:
-                ids = _place_row_z(fixed, a, y, plan, material_color)
+                ids = _place_row_z(fixed, a, y, plan, material_color, strict=auto_base_y)
             placed_total += len(ids)
             row_seams.update(seams)
             row_segments.append({
@@ -688,6 +807,7 @@ def _part_footprint(part_id: str, rotation: str) -> tuple[int, int]:
 
 def _tile_rect(x_min: float, z_min: float, x_max: float, z_max: float,
                y: float, color: str | int, part_id: str, rotation: str,
+               strict: bool = False,
                ) -> list[str]:
     s = _server()
     step_x, step_z = _part_footprint(part_id, rotation)
@@ -698,7 +818,9 @@ def _tile_rect(x_min: float, z_min: float, x_max: float, z_max: float,
         for iz in range(n_z):
             cx = x_min + step_x / 2 + ix * step_x
             cz = z_min + step_z / 2 + iz * step_z
-            ids.append(s.add_part(part_id, color, cx, y, cz, rotation=rotation)["instance_id"])
+            ids.append(
+                s.add_part(part_id, color, cx, y, cz, rotation=rotation, strict=strict)["instance_id"]
+            )
     return ids
 
 
@@ -746,14 +868,15 @@ def build_stepped_gable_roof(x_min: float, z_min: float, x_max: float, z_max: fl
             left = (x_min, low, x_max, min(low + band, high))
             right = (x_min, max(high - band, low), x_max, high)
         strips = [left]
-        if right[0] > left[2] + 0.1 or right[1] > left[3] + 0.1:
+        same_strip = all(abs(a - b) <= 0.1 for a, b in zip(left, right))
+        if not same_strip:
             strips.append(right)
         if not strips:
             break
         y = eave_y - layer * layer_height
         layer_ids: list[str] = []
         for sx0, sz0, sx1, sz1 in strips:
-            layer_ids.extend(_tile_rect(sx0, sz0, sx1, sz1, y, color, part_id, rotation))
+            layer_ids.extend(_tile_rect(sx0, sz0, sx1, sz1, y, color, part_id, rotation, strict=True))
         if not layer_ids:
             break
         placed.extend(layer_ids)
@@ -804,7 +927,7 @@ def build_stepped_pyramid_roof(x_min: float, z_min: float, x_max: float, z_max: 
                 strips.append((inner_x0, max(high_z - band, low_z), inner_x1, high_z, "identity"))
         layer_ids: list[str] = []
         for sx0, sz0, sx1, sz1, rotation in strips:
-            layer_ids.extend(_tile_rect(sx0, sz0, sx1, sz1, y, color, part_id, rotation))
+            layer_ids.extend(_tile_rect(sx0, sz0, sx1, sz1, y, color, part_id, rotation, strict=True))
         if not layer_ids:
             break
         placed.extend(layer_ids)
@@ -864,8 +987,14 @@ def place_on_top(base_instance_id: str, new_part_id: str,
     new_y = base.y - base_part.height          # B's bottom == A's top face
     new_x = base.x + stud_offset_x * STUD
     new_z = base.z + stud_offset_z * STUD
-    r = s.add_part(new_part_id, color, new_x, new_y, new_z, rotation=rotation,
-                   strict=True)
+    try:
+        r = s.add_part(new_part_id, color, new_x, new_y, new_z, rotation=rotation,
+                       strict=True)
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("strict: "):
+            message = message.removeprefix("strict: ")
+        raise ValueError(f"Cannot place: {message}") from exc
     return {"ok": True, "instance_id": r["instance_id"], "position": [new_x, new_y, new_z]}
 
 
@@ -918,14 +1047,25 @@ def find_valid_placements(part_id: str, near_part_id: str) -> dict[str, Any]:
     r = find_connections(a, b)
     # Translate from "relative to A at origin" to "absolute world coords".
     abs_placements = []
+    seen_positions: set[tuple[int, int, int]] = set()
     for p in r["b_on_a_placements"]:
+        key = (
+            int(round(a_inst.x + p["x"])),
+            int(round(a_inst.y + p["y"])),
+            int(round(a_inst.z + p["z"])),
+        )
+        if key in seen_positions:
+            continue
+        seen_positions.add(key)
         abs_placements.append({**p,
                                 "world_x": a_inst.x + p["x"],
                                 "world_y": a_inst.y + p["y"],
                                 "world_z": a_inst.z + p["z"]})
     return {"part_id": part_id, "near_part_id": near_part_id,
             "placements": abs_placements,
-            "count": len(abs_placements)}
+            "count": len(abs_placements),
+            "raw_count": len(r["b_on_a_placements"]),
+            "deduped_by_world_position": True}
 
 
 def suggest_next_brick_for_wall(subassembly: str) -> dict[str, Any]:
@@ -972,19 +1112,28 @@ def build_wall(x0: float, z0: float, x1: float, z1: float,
                 color: str | int = "light_bluish_gray",
                 bond: str = "running",
                 brick_part: str = "3001",
-                base_y: float = -4,
+                base_y: float | None = None,
                 inset_ends: float = 0,
                 ) -> dict[str, Any]:
+    bond_key = bond.strip().lower()
+    if bond_key == "stretcher":
+        bond_key = "running"
+    if bond_key == "stacked":
+        bond_key = "stack"
+    if bond_key not in ("running", "stack"):
+        raise ValueError("bond must be 'running'/'stretcher' or 'stack'")
     pal = ["3001", "3004"] if brick_part == "3001" else list(PALETTE_DEFAULT_BODY)
     if abs(x1 - x0) >= abs(z1 - z0):
         sx = min(x0, x1) + inset_ends
         ex = max(x0, x1) - inset_ends
         return build_wall_segment(sx, z0, ex, z0, height_rows=height_rows,
                                    color=color, palette=pal, base_y=base_y,
+                                   bond=bond_key,
                                    strict_grid=False)
     else:
         sz = min(z0, z1) + inset_ends
         ez = max(z0, z1) - inset_ends
         return build_wall_segment(x0, sz, x0, ez, height_rows=height_rows,
                                    color=color, palette=pal, base_y=base_y,
+                                   bond=bond_key,
                                    strict_grid=False)

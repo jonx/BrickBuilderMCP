@@ -30,6 +30,17 @@ STUD_CIRCLE_SIDES = 12
 MAX_STUDS_PER_PART = 256  # skip on baseplate-size parts to keep render fast
 FACE_COVER_TOL = 0.5
 MESH_MAX_DEPTH = 8
+REAL_MESH_NAME_TOKENS = (
+    "cone",
+    "cylinder",
+    "dish",
+    "round",
+    "tyre",
+    "tire",
+    "wedge",
+    "wheel",
+    "wing",
+)
 
 DEBUG_PALETTE: tuple[tuple[int, int, int], ...] = (
     (226, 74, 51),
@@ -75,7 +86,6 @@ def _apply_transform12(t: Transform12, v: Vec3) -> Vec3:
 
 
 def _compose_transform12(a: Transform12, b: Transform12) -> Transform12:
-    """Compose LDraw type-1 transforms: world = a @ b."""
     ax, ay, az = a[0], a[1], a[2]
     am = a[3:12]
     bx, by, bz = b[0], b[1], b[2]
@@ -95,7 +105,6 @@ def _compose_transform12(a: Transform12, b: Transform12) -> Transform12:
 
 
 def _resolve_ldraw_file(filename: str) -> Path | None:
-    """Resolve a part/subpart/primitive filename inside the installed library."""
     from lego_mcp.parts import LDRAW_HOME
 
     fname = filename.strip().lower().replace("\\", "/")
@@ -114,7 +123,7 @@ def _resolve_ldraw_file(filename: str) -> Path | None:
 
 
 def _parse_mesh_file(filename: str, transform: Transform12, depth: int = 0) -> list[MeshFace]:
-    """Recursively collect LDraw triangle/quad geometry in part-local coords."""
+    """Collect triangles/quads from an LDraw part in part-local coordinates."""
     if depth > MESH_MAX_DEPTH:
         return []
     path = _resolve_ldraw_file(filename)
@@ -146,11 +155,10 @@ def _parse_mesh_file(filename: str, transform: Transform12, depth: int = 0) -> l
             except ValueError:
                 invert_next = False
                 continue
-            child_name = " ".join(tokens[14:]).strip()
             child_transform = _compose_transform12(transform, values)  # type: ignore[arg-type]
-            child_faces = _parse_mesh_file(child_name, child_transform, depth + 1)
+            child_faces = _parse_mesh_file(" ".join(tokens[14:]).strip(), child_transform, depth + 1)
             if invert_next:
-                child_faces = tuple(tuple(reversed(face)) for face in child_faces)  # type: ignore[assignment]
+                child_faces = [tuple(reversed(face)) for face in child_faces]
             faces.extend(child_faces)
             invert_next = False
         elif head in {"3", "4"}:
@@ -177,11 +185,14 @@ def _parse_mesh_file(filename: str, transform: Transform12, depth: int = 0) -> l
 
 @lru_cache(maxsize=4096)
 def _part_mesh_faces(part_id: str) -> tuple[MeshFace, ...]:
-    """Return cached real LDraw faces for a part, or empty tuple on fallback."""
     identity: Transform12 = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
                              0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    faces = _parse_mesh_file(f"{part_id}.dat", identity)
-    return tuple(faces)
+    return tuple(_parse_mesh_file(f"{part_id}.dat", identity))
+
+
+def _should_render_real_mesh(part: "Part") -> bool:
+    name = part.name.lower()
+    return any(token in name for token in REAL_MESH_NAME_TOKENS)
 
 
 def _face_shade_factor(corners3d: list[Vec3]) -> float:
@@ -199,8 +210,6 @@ def _face_shade_factor(corners3d: list[Vec3]) -> float:
     if length < 1e-6:
         return 0.85
     nx, ny, nz = nx / length, ny / length, nz / length
-    # LDraw winding is not guaranteed without full BFC handling. Use absolute
-    # components so the two sides of thin plates shade consistently.
     return 0.62 + 0.36 * abs(ny) + 0.12 * max(abs(nx), abs(nz))
 
 
@@ -513,21 +522,41 @@ def render_model_png(
         target.append((closeness, screen, color, style))
         all_proj.extend(screen)
 
-    def _render_real_mesh(inst, part, rgb_face, draw_edges: bool) -> bool:
-        """Draw real LDraw mesh faces when the installed library has them."""
+    def _world_from_local(m, inst, local_points: list[tuple[float, float, float]]
+                          ) -> list[tuple[float, float, float]]:
+        out = []
+        for lx, ly, lz in local_points:
+            wx, wy, wz = matrix_apply(m, (lx, ly, lz))
+            out.append((wx + inst.x, wy + inst.y, wz + inst.z))
+        return out
+
+    def _emit_studs_for_matrix(inst, part, rgb_face, m) -> None:
+        cap_fill = _shade(rgb_face, 1.25)
+        side_fill = _shade(rgb_face, 0.65)
+        for sx_local, sy_local, sz_local in _stud_positions_local(part):
+            base_ring = [
+                (sx_local + STUD_RADIUS * math.cos(2 * math.pi * i / STUD_CIRCLE_SIDES),
+                 sy_local,
+                 sz_local + STUD_RADIUS * math.sin(2 * math.pi * i / STUD_CIRCLE_SIDES))
+                for i in range(STUD_CIRCLE_SIDES)
+            ]
+            top_ring = [(x, y - STUD_HEIGHT, z) for x, y, z in base_ring]
+            n = STUD_CIRCLE_SIDES
+            for i in range(n):
+                j = (i + 1) % n
+                _emit_face(_world_from_local(m, inst, [base_ring[i], base_ring[j], top_ring[j], top_ring[i]]),
+                           side_fill)
+            _emit_face(_world_from_local(m, inst, top_ring), cap_fill)
+
+    def _render_real_mesh(inst, part, rgb_face) -> bool:
         mesh = _part_mesh_faces(part.part_id)
         if not mesh:
             return False
         m = effective_matrix(inst)
         for local_face in mesh:
-            world: list[Vec3] = []
-            for lx, ly, lz in local_face:
-                wx, wy, wz = matrix_apply(m, (lx, ly, lz))
-                world.append((wx + inst.x, wy + inst.y, wz + inst.z))
+            world = _world_from_local(m, inst, list(local_face))
             if len(world) >= 3:
                 _emit_face(world, _shade(rgb_face, _face_shade_factor(world)))
-                if draw_edges:
-                    _emit_edge(world)
         return True
 
     part_records = []
@@ -554,7 +583,7 @@ def render_model_png(
         if is_ghost:
             rgb = _ghost(rgb)
 
-        if _render_real_mesh(inst, part, rgb, draw_edges=not is_ghost):
+        if _should_render_real_mesh(part) and _render_real_mesh(inst, part, rgb):
             continue
 
         # Parts with a non-canonical rotation matrix (imported from external
@@ -562,6 +591,8 @@ def render_model_png(
         # their actual oriented box, not as their world-space AABB.
         if inst.matrix is not None:
             _render_oriented_box(inst, part, rgb)
+            if not is_ghost:
+                _emit_studs_for_matrix(inst, part, rgb, effective_matrix(inst))
             continue
 
         w, h, d = (xmax - xmin), (ymax - ymin), (zmax - zmin)

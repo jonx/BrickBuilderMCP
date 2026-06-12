@@ -51,3 +51,16 @@ def test_find_and_apply_subassembly_connection_offset():
     assert v["summary"]["collisions"] == 0
     assert v["summary"]["floating"] == 0
     assert v["summary"]["unanchored"] == 0
+
+
+def test_server_port_analysis_defaults_to_summary_without_connector_dump():
+    server.create_model()
+    server.add_part("3001", "red", 0, 0, 0)
+
+    r = server.analyze_assembly_ports(max_ports=1)
+
+    assert r["exposed_connector_count"] == 16
+    assert r["ports_total"] == 2
+    assert len(r["ports"]) == 1
+    assert r["connectors"] == []
+    assert r["connectors_truncated"] is True

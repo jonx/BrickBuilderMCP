@@ -29,6 +29,7 @@ def test_render_returns_summary_dict_and_image(tmp_path, monkeypatch):
     server.add_part("3024", "yellow", 40, 0, 0)
     summary, image = _summary_and_image(server.render_model(400, 300))
     assert summary["ok"]
+    assert summary["hidden_edges"] is False
     assert image.data.startswith(b"\x89PNG")
     assert summary["bytes"] == len(image.data)
     from pathlib import Path

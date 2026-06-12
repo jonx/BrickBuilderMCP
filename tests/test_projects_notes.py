@@ -39,6 +39,17 @@ def test_list_projects_finds_saved(tmp_path, monkeypatch):
     assert {"alpha", "beta"}.issubset(names)
 
 
+def test_list_projects_hides_internal_autosave(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "PROJECTS_DIR", tmp_path)
+    (tmp_path / "_autosave.mpd").write_text("0 FILE _autosave.ldr\n")
+    (tmp_path / "visible.mpd").write_text("0 FILE visible.ldr\n")
+
+    names = {p["name"] for p in server.list_projects()["projects"]}
+
+    assert "visible" in names
+    assert "_autosave" not in names
+
+
 def test_load_unknown_project_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "PROJECTS_DIR", tmp_path)
     with pytest.raises(ValueError):

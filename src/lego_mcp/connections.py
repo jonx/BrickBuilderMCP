@@ -150,7 +150,8 @@ def _distinct_xz(placements: list[Placement]) -> int:
     return len({(round(p.x, 1), round(p.z, 1), round(p.y, 1)) for p in placements})
 
 
-def find_connections(a: Part, b: Part, *, full_nesting_only: bool = False) -> dict[str, Any]:
+def find_connections(a: Part, b: Part, *, full_nesting_only: bool = False,
+                     min_studs_matched: int = 1) -> dict[str, Any]:
     """High-level summary: every way B can connect to A, in both directions.
 
     `total_ways` counts (translation, rotation) pairs. `distinct_outcomes`
@@ -159,14 +160,17 @@ def find_connections(a: Part, b: Part, *, full_nesting_only: bool = False) -> di
     physical outcomes, because 2x2 is symmetric under 90° rotation).
 
     By default we return all placements with >= 1 stud clutched (so
-    running-bond half-overlap counts as connected). Set
+    running-bond half-overlap counts as connected). Increase
+    min_studs_matched to reduce noisy partial placements. Set
     full_nesting_only=True to only return placements where ALL of B's
     receptors mate with A studs.
     """
+    if min_studs_matched < 1:
+        raise ValueError("min_studs_matched must be >= 1")
     receptors_b = len(receptor_positions(b))
     receptors_a = len(receptor_positions(a))
-    min_b = receptors_b if full_nesting_only else 1
-    min_a = receptors_a if full_nesting_only else 1
+    min_b = receptors_b if full_nesting_only else min_studs_matched
+    min_a = receptors_a if full_nesting_only else min_studs_matched
     b_on_a = find_placements_b_on_a(a, b, min_studs_matched=min_b)
     a_on_b = []
     for p in find_placements_b_on_a(b, a, min_studs_matched=min_a):

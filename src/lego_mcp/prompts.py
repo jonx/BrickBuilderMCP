@@ -31,6 +31,7 @@ WORKFLOW_BLURB = """\
 2. `validate_model` — fix any collisions/unknowns the report flags.
 3. `render_model` — look at the result; check proportions, alignment, colors.
    Use `render_model(color_mode="instance")` or `"row"` when debugging brick layout.
+   Use `hidden_edges=True` only when you need internal/contact guides.
 4. If wrong: `undo` or `restore_checkpoint`. If right: `save_checkpoint` and continue.
 
 For models above ~100 parts, decompose into **subassemblies**:
@@ -44,7 +45,8 @@ TECHNIQUES_BLURB = """\
 
 - **Running bond (stretcher)**: each brick row offset by half a brick from the row below — distributes load, looks like real masonry. Use `build_wall(..., bond="running")`.
 - **Bonded rectilinear perimeters**: use `build_perimeter(points=[...])` for footprints from images/plans/models. Use `build_room(...)` only as the rectangle shortcut. Corners alternate direction by row; use `palette=["3001"]` when you specifically want 2x4-only walls and the dimensions fit.
-- **Openings and arches**: use `build_wall_with_openings(...)` for straight walls with rectangular, round-arch, or lancet spans. Keep opening edges on the stud grid and leave at least two studs of pier between adjacent openings.
+- **Floors + walls compose automatically**: `build_floor(...)` defaults to ground level, and wall helpers with omitted `base_y` stack on the highest overlapping support. Pass `base_y` only when you deliberately need a custom elevation.
+- **Openings and arches**: use `build_wall_with_openings(...)` for straight walls with rectangular, round-arch, or lancet spans. Use `x_min/x_max` or `z_min/z_max` for world-coordinate openings. Keep opening edges on the stud grid and leave at least two studs of pier between adjacent openings.
 - **Roofs**: use `build_stepped_gable_roof(...)` for nave/house roofs and `build_stepped_pyramid_roof(...)` for towers. The default parts are connector-aware, so validation can prove the roof is supported.
 - **English bond**: alternating header (short side facing out) and stretcher rows. Use for thick, sturdy walls.
 - **Plates instead of bricks**: 3 plates = 1 brick height. Use plates where you need fine height control or where the model will be picked up (plates lock).
@@ -110,9 +112,9 @@ You're driving the **LegoMCP** server. Below is the full toolbox + the workflow 
 ## Building tools (in order of preference)
 
 **High-level helpers** — use these first; they handle stagger / corners / fits:
-- `build_room(x_min, z_min, x_max, z_max, height_rows, color, base_y)` — 4 walls + corner columns.
-- `build_wall_segment(x0, z0, x1, z1, height_rows, color, base_y)` — one straight wall with running-bond stagger.
-- `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` — tile a rectangle.
+- `build_room(x_min, z_min, x_max, z_max, height_rows, color, base_y)` — bonded rectangular walls; omit `base_y` to auto-stack.
+- `build_wall_segment(x0, z0, x1, z1, height_rows, color, base_y)` — one straight wall with running-bond stagger; omit `base_y` to auto-stack.
+- `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` — tile a rectangle; default `y=0`.
 - `place_on_top(base_id, new_part_id, color, stud_offset_x, stud_offset_z, rotation)` — stud-grid stacking.
 - `place_next_to(reference_id, new_part_id, color, side, offset, rotation)` — flush placement.
 

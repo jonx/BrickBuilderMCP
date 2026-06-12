@@ -149,7 +149,7 @@ def _port_dict(port_id: str, cluster: list[ConnectorRef]) -> dict[str, Any]:
     }
 
 
-def analyze_ports(parts: dict[str, Any], max_connectors: int = 200,
+def analyze_ports(parts: dict[str, Any], max_connectors: int = 0,
                   max_ports: int = 50) -> dict[str, Any]:
     exposed = exposed_connectors(parts)
     clusters = _cluster_connectors(exposed)

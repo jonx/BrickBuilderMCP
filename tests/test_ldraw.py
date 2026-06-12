@@ -50,3 +50,29 @@ def test_import_flattens_multi_block_mpd(tmp_path):
     assert len(server.STATE.parts) == 2
     part_ids = {inst.part_id for inst in server.STATE.parts.values()}
     assert part_ids == {"3001", "3003"}
+
+
+def test_import_nested_mpd_does_not_duplicate_referenced_blocks(tmp_path):
+    sample = (
+        "0 FILE main.ldr\n"
+        "1 16 100 0 0 1 0 0 0 1 0 0 0 1 outer.ldr\n"
+        "0 NOFILE\n"
+        "0 FILE outer.ldr\n"
+        "1 4 0 0 0 1 0 0 0 1 0 0 0 1 3001.dat\n"
+        "1 16 0 -24 0 1 0 0 0 1 0 0 0 1 inner.ldr\n"
+        "0 NOFILE\n"
+        "0 FILE inner.ldr\n"
+        "1 1 0 0 0 1 0 0 0 1 0 0 0 1 3003.dat\n"
+        "0 NOFILE\n"
+    )
+    f = tmp_path / "nested.mpd"
+    f.write_text(sample)
+
+    r = server.import_ldr(str(f))
+
+    assert r["loaded"] == 2
+    assert len(server.STATE.parts) == 2
+    parts_by_id = {inst.part_id: inst for inst in server.STATE.parts.values()}
+    assert set(parts_by_id) == {"3001", "3003"}
+    assert (parts_by_id["3001"].x, parts_by_id["3001"].y, parts_by_id["3001"].z) == (100, 0, 0)
+    assert (parts_by_id["3003"].x, parts_by_id["3003"].y, parts_by_id["3003"].z) == (100, -24, 0)

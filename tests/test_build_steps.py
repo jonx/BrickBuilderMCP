@@ -1,4 +1,5 @@
 from lego_mcp import server
+from lego_mcp import helpers
 
 
 def test_plan_build_sequence_orders_stack_bottom_up():
@@ -35,7 +36,20 @@ def test_plan_build_sequence_reports_unsupported_target_piece():
     assert not r["ok"]
     assert r["sequenced"] == 0
     assert r["blocked_count"] == 1
+    assert "blocked" in r["blocked_summary"]["message"]
     assert r["blocked"][0]["instance_id"] == unsupported
+
+
+def test_plan_build_sequence_handles_default_floor_and_auto_stacked_wall():
+    server.create_model()
+    helpers.build_floor(0, 0, 160, 120)
+    helpers.build_wall_with_openings(0, 0, 160, 0, height_rows=2, color="red")
+
+    r = server.plan_build_sequence(max_steps=5)
+
+    assert r["ok"]
+    assert r["blocked_count"] == 0
+    assert r["total_parts"] > 0
 
 
 def test_plan_build_sequence_can_filter_subassembly():

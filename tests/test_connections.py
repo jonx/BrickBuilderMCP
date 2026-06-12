@@ -91,3 +91,15 @@ def test_find_connections_summary_includes_both_directions():
     assert r["part_b"] == "3003"
     assert r["b_on_a_placements"]
     assert r["a_on_b_placements"] == []
+
+
+def test_find_connections_can_filter_by_min_studs_matched():
+    a = server.PART_INDEX["3001"]
+    b = server.PART_INDEX["3001"]
+
+    loose = find_connections(a, b)
+    tighter = find_connections(a, b, min_studs_matched=8)
+
+    assert tighter["total_ways"] < loose["total_ways"]
+    assert all(p["studs_matched"] >= 8 for p in tighter["b_on_a_placements"])
+    assert all(p["studs_matched"] >= 8 for p in tighter["a_on_b_placements"])

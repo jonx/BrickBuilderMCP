@@ -25,6 +25,25 @@ def test_build_wall_z_running_works_too():
     assert v["summary"]["collisions"] == 0
 
 
+def test_build_wall_stack_bond_keeps_matching_seams():
+    server.create_model()
+    r = helpers.build_wall(0, 0, 320, 0, height_rows=2, color="red", bond="stack")
+
+    assert r["ok"]
+    assert r["bond"] == "stack"
+    assert r["rows"][0]["seams"] == r["rows"][1]["seams"]
+
+
+def test_build_wall_rejects_unknown_bond():
+    server.create_model()
+    try:
+        helpers.build_wall(0, 0, 320, 0, height_rows=2, color="red", bond="flemish")
+    except ValueError as exc:
+        assert "bond must" in str(exc)
+    else:
+        raise AssertionError("expected unknown bond to be rejected")
+
+
 def test_build_floor_tiles_a_rectangle():
     server.create_model()
     r = helpers.build_floor(-80, -80, 80, 80, y=-4, color="tan", part_id="3022")

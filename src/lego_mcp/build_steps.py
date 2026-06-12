@@ -67,6 +67,24 @@ def _step_payload(step: int, inst: Any, aabb: tuple,
     }
 
 
+def _blocked_summary(blocked: list[dict[str, Any]]) -> dict[str, Any]:
+    by_part: dict[str, int] = {}
+    ungrounded_lowest: list[dict[str, Any]] = []
+    for item in blocked:
+        by_part[item["part_id"]] = by_part.get(item["part_id"], 0) + 1
+        if not item.get("possible_supports") and not item.get("needs_supporters_in_built"):
+            ungrounded_lowest.append(item)
+    ungrounded_lowest.sort(key=lambda b: (-b.get("bottom_y", 0), b["part_id"], b["instance_id"]))
+    return {
+        "message": (
+            f"{len(blocked)} parts blocked. "
+            f"{len(ungrounded_lowest)} have no possible support in the target model."
+        ),
+        "by_part": dict(sorted(by_part.items(), key=lambda kv: (-kv[1], kv[0]))[:10]),
+        "first_ungrounded": ungrounded_lowest[:5],
+    }
+
+
 def plan_build_sequence(parts: dict[str, Any],
                         part_index: dict[str, Any],
                         part_aabb_world: Callable[[Any, Any], tuple],
@@ -137,7 +155,8 @@ def plan_build_sequence(parts: dict[str, Any],
                 "sequenced": len(ordered),
                 "unknown_parts": unknown,
                 "blocked_count": len(blocked),
-                "blocked": blocked[:50],
+                "blocked_summary": _blocked_summary(blocked),
+                "blocked": blocked[:10],
                 "steps": steps[start_after:(
                     None if max_steps is None else start_after + max_steps
                 )],
@@ -164,6 +183,7 @@ def plan_build_sequence(parts: dict[str, Any],
         "sequenced": len(ordered),
         "unknown_parts": unknown,
         "blocked_count": 0,
+        "blocked_summary": None,
         "steps": steps[start_after:window_end],
         "start_after": start_after,
         "max_steps": max_steps,
@@ -263,8 +283,8 @@ def next_unbuilt_step(parts: dict[str, Any],
         "remaining": len(unbuilt),
         "candidates": candidates,
         "blocked_count": len(blocked),
-        "blocked": blocked[:20],
+        "blocked_summary": _blocked_summary(blocked) if blocked else None,
+        "blocked": blocked[:10],
         "complete": len(unbuilt) == 0,
         "unknown_parts": unknown,
     }
-
