@@ -247,11 +247,12 @@ def _covers_interval(cover_min: float, cover_max: float,
 def _face_is_fully_covered(face: str, aabb: tuple, all_aabbs: list[tuple]) -> bool:
     """Cull faces that are exactly hidden by a touching neighboring AABB.
 
-    The renderer only draws the three faces visible from the fixed camera:
-    top (-Y), east (+X), and south/front (+Z). If another part shares and
-    fully covers one of those planes, drawing that face creates impossible
-    internal edges. This is intentionally conservative: partial coverage is
-    left to the painter pass so we don't accidentally erase visible surfaces.
+    The renderer draws the three faces visible from the camera: top (-Y) plus
+    one lateral X face and one lateral Z face chosen from the view angle. If
+    another part shares and fully covers one of those planes, drawing that
+    face creates impossible internal edges. This is intentionally
+    conservative: partial coverage is left to the painter pass so we don't
+    accidentally erase visible surfaces.
     """
     (xmin, ymin, zmin), (xmax, ymax, zmax) = aabb
     for other in all_aabbs:
@@ -268,8 +269,18 @@ def _face_is_fully_covered(face: str, aabb: tuple, all_aabbs: list[tuple]) -> bo
                     and _covers_interval(oymin, oymax, ymin, ymax)
                     and _covers_interval(ozmin, ozmax, zmin, zmax)):
                 return True
+        elif face == "west":
+            if (abs(oxmax - xmin) <= FACE_COVER_TOL
+                    and _covers_interval(oymin, oymax, ymin, ymax)
+                    and _covers_interval(ozmin, ozmax, zmin, zmax)):
+                return True
         elif face == "south":
             if (abs(ozmin - zmax) <= FACE_COVER_TOL
+                    and _covers_interval(oxmin, oxmax, xmin, xmax)
+                    and _covers_interval(oymin, oymax, ymin, ymax)):
+                return True
+        elif face == "north":
+            if (abs(ozmax - zmin) <= FACE_COVER_TOL
                     and _covers_interval(oxmin, oxmax, xmin, xmax)
                     and _covers_interval(oymin, oymax, ymin, ymax)):
                 return True
@@ -596,16 +607,24 @@ def render_model_png(
             continue
 
         w, h, d = (xmax - xmin), (ymax - ymin), (zmax - zmin)
+        # Which lateral faces does the camera see after the yaw? The camera
+        # looks along -CAM_DIR, so the +X face is visible iff closeness_x > 0,
+        # else the -X face; same for Z. (At exactly 0 the face is edge-on.)
+        x_face = "east" if closeness_x >= 0 else "west"
+        z_face = "south" if closeness_z >= 0 else "north"
+        xf = xmax if x_face == "east" else xmin
+        zf = zmax if z_face == "south" else zmin
+
         top_covers = _face_is_fully_covered("top", aabb, all_aabbs)
-        east_covers = _face_is_fully_covered("east", aabb, all_aabbs)
-        south_covers = _face_is_fully_covered("south", aabb, all_aabbs)
+        x_covers = _face_is_fully_covered(x_face, aabb, all_aabbs)
+        z_covers = _face_is_fully_covered(z_face, aabb, all_aabbs)
 
         top = [(xmin, ymin, zmin), (xmax, ymin, zmin),
                (xmax, ymin, zmax), (xmin, ymin, zmax)]
-        east = [(xmax, ymin, zmin), (xmax, ymin, zmax),
-                (xmax, ymax, zmax), (xmax, ymax, zmin)]
-        south = [(xmin, ymin, zmax), (xmax, ymin, zmax),
-                 (xmax, ymax, zmax), (xmin, ymax, zmax)]
+        x_quad = [(xf, ymin, zmin), (xf, ymin, zmax),
+                  (xf, ymax, zmax), (xf, ymax, zmin)]
+        z_quad = [(xmin, ymin, zf), (xmax, ymin, zf),
+                  (xmax, ymax, zf), (xmin, ymax, zf)]
 
         if top_covers:
             if hidden_edges:
@@ -615,21 +634,21 @@ def render_model_png(
                         length_u=w, length_v=d, fill=_shade(rgb, 1.10))   # top
             _emit_edge(top)
 
-        if east_covers:
+        if x_covers:
             if hidden_edges:
-                _emit_edge(east, "dotted")
+                _emit_edge(x_quad, "dotted")
         else:
-            _split_rect(p0=(xmax, ymin, zmin), du=(0, h, 0), dv=(0, 0, d),
-                        length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # east/right
-            _emit_edge(east)
+            _split_rect(p0=(xf, ymin, zmin), du=(0, h, 0), dv=(0, 0, d),
+                        length_u=h, length_v=d, fill=_shade(rgb, 0.85))   # lateral X
+            _emit_edge(x_quad)
 
-        if south_covers:
+        if z_covers:
             if hidden_edges:
-                _emit_edge(south, "dotted")
+                _emit_edge(z_quad, "dotted")
         else:
-            _split_rect(p0=(xmin, ymin, zmax), du=(w, 0, 0), dv=(0, h, 0),
-                        length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # south/front
-            _emit_edge(south)
+            _split_rect(p0=(xmin, ymin, zf), du=(w, 0, 0), dv=(0, h, 0),
+                        length_u=w, length_v=h, fill=_shade(rgb, 0.70))   # lateral Z
+            _emit_edge(z_quad)
 
         # Studs on top. Each stud is a real 4-LDU-tall, 6-LDU-radius cylinder:
         # we emit a TOP DISC (the cap) plus the cylindrical SIDE BAND so the
