@@ -734,6 +734,41 @@ def list_parts(limit: int = 200, subassembly: str | None = None) -> dict[str, An
 
 
 @mcp.tool()
+def bill_of_materials(subassembly: str | None = None,
+                      bricklink: bool = False) -> dict[str, Any]:
+    """The orderable parts list for the current model.
+
+    Aggregates every placed part into lots — one per (part_id, color) — with
+    quantities and human-readable part + color names, sorted most-needed
+    first. This is the "what do I need to buy" view (vs. list_parts, which
+    dumps individual instances).
+
+    Args:
+        subassembly: limit to one subassembly; None = whole model.
+        bricklink: also return a BrickLink Wanted List XML string under
+            `bricklink_xml` (upload it at bricklink.com to order). Colors
+            without a verified BrickLink mapping are flagged in
+            `bricklink_warnings` instead of guessed.
+    """
+    from lego_mcp import bom as _bom
+    pool = [p for p in STATE.parts.values()
+            if subassembly is None or p.subassembly == subassembly]
+    lots = _bom.aggregate(pool, PART_INDEX)
+    out: dict[str, Any] = {
+        "model": STATE.name,
+        "subassembly_filter": subassembly,
+        **_bom.summary(lots),
+        "lots": [l.as_dict() for l in lots],
+        "text": _bom.format_table(lots, STATE.name),
+    }
+    if bricklink:
+        xml, warnings = _bom.to_bricklink_xml(lots)
+        out["bricklink_xml"] = xml
+        out["bricklink_warnings"] = warnings
+    return out
+
+
+@mcp.tool()
 def search_parts_tool(query: str, limit: int = 20) -> dict[str, Any]:
     """Search the active part catalog (built-in + LDraw library if installed)."""
     _ensure_library_loaded()

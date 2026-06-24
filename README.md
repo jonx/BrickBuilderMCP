@@ -6,7 +6,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **build
 
 *A 1,024-piece fortress city designed entirely through these tools — 1,576 verified stud connections, zero floating parts, zero collisions, validated at every stage. The model is [examples/fortress_city.ldr](examples/fortress_city.ldr); open it in Studio.*
 
-Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 54 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
+Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 55 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
 > **Status: early days, but the foundation is now load-bearing.** The pipeline runs end-to-end — install, talk to Claude, get an exportable `.ldr` — and the connection model is enforced for the entire 24k-part catalog: every placement reports what it actually clutches, strict mode rejects physically impossible positions, and the validator's ground truth is real stud↔receiver mating (in both directions — hanging parts under overhangs is a first-class connection). Structured architecture (walls, towers, gates, roofs — the fortress above) builds reliably through the helpers.
 >
@@ -41,7 +41,7 @@ Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan ba
 - [Prompts (slash menu)](#prompts-slash-menu)
 - [Resources](#resources)
 - [Run as a standalone agent](#run-as-a-standalone-agent-no-claude-desktop)
-- [Standalone CLI: `lego-mcp render`](#standalone-cli-lego-mcp-render)
+- [Standalone CLI: `render` / `bom` / `instructions`](#standalone-cli)
 - [Development](#development)
 - [Known limitations](#known-limitations)
 - [License](#license)
@@ -144,7 +144,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 ## The tools, grouped
 
-54 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
+55 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
 
 ### Model state
 
@@ -152,6 +152,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 |---|---|
 | `create_model(name, include_manual=True)` | Reset to a fresh empty model. The result carries `getting_started` — the building manual (coordinates, connection rules, workflow, tool order) — so the LLM gets the rules at the exact moment a build begins. The same manual ships as MCP server `instructions` at connection time. |
 | `list_parts(limit, subassembly)` | List current parts (optionally filtered to one subassembly). |
+| `bill_of_materials(subassembly, bricklink=False)` | The orderable parts list: quantities per (part_id, color) with part + color names, sorted most-needed first. `bricklink=True` also returns a BrickLink Wanted List XML (`bricklink_xml`) you can upload to order; colors without a verified BrickLink mapping are flagged in `bricklink_warnings` rather than guessed. |
 
 ### Placement (raw)
 
@@ -350,7 +351,15 @@ The agent spawns `lego-mcp` as a subprocess, fetches the tool list over MCP JSON
 
 ---
 
-## Standalone CLI: `lego-mcp render`
+## Standalone CLI
+
+Three one-shot commands that work on an `.ldr` / `.mpd` file from the shell — no MCP server, no Claude Desktop:
+
+- `lego-mcp render <file>` — render to PNG (below).
+- `lego-mcp bom <file>` — the orderable parts list (below).
+- `lego-mcp instructions <file>` — step-by-step build order (below).
+
+### `lego-mcp render`
 
 For when you want to render an `.ldr` / `.mpd` file from the shell — previewing an OMR download, batching renders for a website, generating a turntable, or just sanity-checking a model someone sent you — without spinning up the MCP server or opening Claude Desktop.
 
@@ -392,6 +401,36 @@ All flags:
 | `-q, --quiet` | off | Suppress progress lines on stdout. |
 
 The watermark draws with a TTF font when one is available (Helvetica / Arial / DejaVu probed in order), falling back to PIL's bitmap default on minimal systems so it never hard-fails.
+
+### `lego-mcp bom` — the parts you need to order
+
+Aggregates a model into an orderable parts list: one row per `(part_id, color)`, sorted most-needed first, with a piece total. The same data the `bill_of_materials` MCP tool returns in-chat.
+
+```bash
+lego-mcp bom model.ldr                          # human-readable table (default)
+lego-mcp bom model.ldr -f csv -o parts.csv      # spreadsheet
+lego-mcp bom model.ldr -f json                  # structured (scripting)
+lego-mcp bom model.ldr -f bricklink -o wanted.xml   # BrickLink Wanted List to upload & order
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `<input>` *(positional)* | — | Path to an `.ldr` / `.mpd` file. |
+| `-f, --format {table,csv,json,bricklink}` | `table` | Output format. `bricklink` writes a Wanted List XML you upload at bricklink.com. |
+| `-o, --output FILE` | stdout | Write to a file instead of printing. |
+
+> The BrickLink export maps the colors it can verify and **flags the rest as warnings** (printed to stderr, and left as a comment in the XML) rather than guessing a wrong color id — so double-check any flagged lots before ordering.
+
+### `lego-mcp instructions` — step-by-step build order
+
+Compiles a finished model into a support-respecting assembly order: baseplates and ground parts first, then every part once something it rests on is already placed. (In-chat, the `plan_build_sequence` / `next_build_step` tools and the interactive builder mode — `start_builder_session` → `next_unbuilt_step` → `mark_built` → `render_progress` — do the same.)
+
+```bash
+lego-mcp instructions model.ldr                 # full numbered build order
+lego-mcp instructions model.ldr --max 20        # first 20 steps
+lego-mcp instructions model.ldr --start 20 --max 20   # next page
+lego-mcp instructions model.ldr --json          # full step payloads (positions, supports)
+```
 
 ### One-liner recipes
 
