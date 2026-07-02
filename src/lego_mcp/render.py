@@ -27,7 +27,8 @@ SIN30 = math.sin(math.radians(30))
 STUD_RADIUS = 6.0      # LDU (real LEGO stud is 6 LDU radius)
 STUD_HEIGHT = 4.0      # LDU
 STUD_CIRCLE_SIDES = 12
-MAX_STUDS_PER_PART = 256  # skip on baseplate-size parts to keep render fast
+MAX_STUDS_PER_PART = 256   # above this, draw cap discs only (no side bands)
+MAX_DISC_STUDS = 4096      # above this, skip studs entirely (render speed)
 FACE_COVER_TOL = 0.5
 MESH_MAX_DEPTH = 8
 REAL_MESH_NAME_TOKENS = (
@@ -301,23 +302,18 @@ def _stud_positions_local(part) -> list[tuple[float, float, float]]:
 
     # Real stud positions from LDraw geometry (after install-library).
     if part.studs:
-        if len(part.studs) > MAX_STUDS_PER_PART:
+        if len(part.studs) > MAX_DISC_STUDS:
             return []
-        # LDraw convention: bricks extend from y=0 (origin/top) to y=+height (bottom).
-        # Our internal convention: origin is at the center of the bottom face,
-        # so the top of the brick is at local y = -part.height. The LDraw stud
-        # positions have y near 0 (the part's TOP in LDraw frame); we flip the
-        # sign and shift so they sit on our top face.
-        out = []
-        for sx, sy, sz in part.studs:
-            # Map LDraw local y (where y=0 is top) to our local y (where -height is top).
-            out.append((sx, -part.height + sy, sz))
-        return out
+        # The AABB path draws the part as a box whose top face is at local
+        # y = -part.height, so seat every stud ON that face. Extracted stud
+        # y values can sit below the AABB top (slopes, stepped parts); using
+        # them raw leaves studs clipped halfway into the box fill.
+        return [(sx, -part.height, sz) for sx, _sy, sz in part.studs]
 
     # Heuristic fallback for built-ins. Slopes: only one row of studs.
     nx = max(1, int(round(part.width / 20)))
     nz = max(1, int(round(part.depth / 20)))
-    if nx * nz > MAX_STUDS_PER_PART:
+    if nx * nz > MAX_DISC_STUDS:
         return []
     top_y = -part.height
     if "slope" in name_lower:
@@ -440,10 +436,19 @@ def render_model_png(
     hidden_outlines: list[Edge] = []
     all_proj: list[tuple[float, float]] = []
 
-    def _emit_face(corners3d: list[tuple[float, float, float]], fill: tuple[int, int, int]) -> None:
+    # Studs are always ON the face they sit on, but a stud that straddles the
+    # 20-LDU top-face subdivision grid (slopes have asymmetric AABBs, so their
+    # studs aren't chunk-centered) can lose the painter tie to an adjacent
+    # face chunk by up to ~2 LDU of closeness, clipping a wedge out of the
+    # cap. A small positive bias keeps stud faces above their own face while
+    # staying far below anything that genuinely covers them.
+    STUD_BIAS = 6.0
+
+    def _emit_face(corners3d: list[tuple[float, float, float]], fill: tuple[int, int, int],
+                   bias: float = 0.0) -> None:
         closeness = sum(closeness_x * cx - cy + closeness_z * cz for (cx, cy, cz) in corners3d) / len(corners3d)
         screen = [project(*c) for c in corners3d]
-        faces.append((closeness, screen, fill))
+        faces.append((closeness + bias, screen, fill))
         all_proj.extend(screen)
 
     def _split_rect(p0: tuple[float, float, float], du: tuple[float, float, float],
@@ -561,8 +566,8 @@ def render_model_png(
             for i in range(n):
                 j = (i + 1) % n
                 _emit_face(_world_from_local(m, inst, [base_ring[i], base_ring[j], top_ring[j], top_ring[i]]),
-                           side_fill)
-            _emit_face(_world_from_local(m, inst, top_ring), cap_fill)
+                           side_fill, bias=STUD_BIAS)
+            _emit_face(_world_from_local(m, inst, top_ring), cap_fill, bias=STUD_BIAS)
 
     def _render_real_mesh(inst, part, rgb_face) -> bool:
         mesh = _part_mesh_faces(part.part_id)
@@ -661,19 +666,35 @@ def render_model_png(
         # the cap would appear visually shifted past the brick's back/right
         # edges (its 4-LDU lift in y projects to a screen_y offset that pulls
         # the disc past the projected top-face edges).
-        rot = resolve_rotation(inst.rotation)
         cap_fill = _shade(rgb, 1.25)        # cap face: brightest
         side_fill = _shade(rgb, 0.65)       # cylinder side: noticeably darker so it reads as a tube
         if not top_covers and not is_ghost:
-            for sx_local, sy_local, sz_local in _stud_positions_local(part):
-                wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
-                world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
-                # Cylinder side first (sorted later by painter — back-facing
-                # segments will draw behind the cap and the brick top).
-                for quad in _stud_side_quads(*world_center):
-                    _emit_face(quad, side_fill)
-                # Top cap on top.
-                _emit_face(_stud_disc_corners(*world_center), cap_fill)
+            if inst.rotation not in ("identity", "rot90y", "rot180y", "rot270y"):
+                # Tilted/sideways part: the flat disc+band shortcut assumes a
+                # vertical stud axis and draws saw-teeth here. Use the full
+                # oriented-ring path instead.
+                _emit_studs_for_matrix(inst, part, rgb, effective_matrix(inst))
+            else:
+                rot = resolve_rotation(inst.rotation)
+                positions = _stud_positions_local(part)
+                # Baseplate-scale parts: cap discs only — the side bands would
+                # triple the polygon count for detail nobody can see.
+                simple = len(positions) > MAX_STUDS_PER_PART
+                for sx_local, sy_local, sz_local in positions:
+                    wx, wy, wz = matrix_apply(rot, (sx_local, sy_local, sz_local))
+                    world_center = (wx + inst.x, wy + inst.y, wz + inst.z)
+                    if simple:
+                        # Disc seated on the face (no band, no 4-LDU lift —
+                        # a lifted disc without its band looks displaced).
+                        _emit_face(_stud_ring(wx + inst.x, wy + inst.y,
+                                              wz + inst.z, STUD_RADIUS),
+                                   cap_fill, bias=STUD_BIAS)
+                    else:
+                        # Cylinder side first (sorted later by painter —
+                        # back-facing segments draw behind cap and brick top).
+                        for quad in _stud_side_quads(*world_center):
+                            _emit_face(quad, side_fill, bias=STUD_BIAS)
+                        _emit_face(_stud_disc_corners(*world_center), cap_fill, bias=STUD_BIAS)
 
     if not all_proj:
         buf = io.BytesIO()
