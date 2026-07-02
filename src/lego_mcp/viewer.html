@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;height:100%;background:#f5f5f8;font:12px -apple-system,sans-serif;overflow:hidden}
+#hud{position:fixed;top:8px;left:8px;background:#fffc;padding:6px 10px;border-radius:6px}
+canvas{display:block;cursor:grab}
+</style></head><body>
+<div id="hud">drag to orbit &middot; wheel to zoom</div><canvas id="c"></canvas>
+<script>
+// Minimal LEGO viewer: painter-sorted boxes, orbit camera. No dependencies,
+// so it renders inside the MCP Apps iframe sandbox with no network access.
+let parts = [], az = 0.785, el = 0.615, zoom = 1;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+function draw() {
+  cv.width = innerWidth; cv.height = innerHeight;
+  const ca=Math.cos(az), sa=Math.sin(az), ce=Math.cos(el), se=Math.sin(el);
+  const P = (x,y,z) => [x*sa - z*ca, se*(x*ca + z*sa) + ce*y];
+  const faces = [];
+  for (const p of parts) {
+    const [w,h,d] = p.dims, cs = [];
+    for (const dx of [-w/2,w/2]) for (const dy of [-h,0]) for (const dz of [-d/2,d/2])
+      cs.push([p.pos[0]+dx, p.pos[1]+dy, p.pos[2]+dz]);
+    const F = [[0,1,3,2],[4,5,7,6],[0,1,5,4],[2,3,7,6],[0,2,6,4],[1,3,7,5]];
+    for (const f of F) {
+      const pts = f.map(i => cs[i]);
+      const depth = pts.reduce((s,c)=>s + ce*(c[0]*ca+c[2]*sa) - se*c[1], 0)/4;
+      faces.push({depth, pts: pts.map(c=>P(c[0],c[1],c[2])), col: p.color});
+    }
+  }
+  faces.sort((a,b)=>a.depth-b.depth);
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for (const f of faces) for (const q of f.pts)
+    { mnx=Math.min(mnx,q[0]); mny=Math.min(mny,q[1]); mxx=Math.max(mxx,q[0]); mxy=Math.max(mxy,q[1]); }
+  const s = Math.min(cv.width/(mxx-mnx+1), cv.height/(mxy-mny+1)) * 0.9 * zoom;
+  const ox = cv.width/2 - (mnx+mxx)/2*s, oy = cv.height/2 - (mny+mxy)/2*s;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  for (const f of faces) {
+    ctx.beginPath();
+    f.pts.forEach((q,i)=> i? ctx.lineTo(q[0]*s+ox,q[1]*s+oy) : ctx.moveTo(q[0]*s+ox,q[1]*s+oy));
+    ctx.closePath();
+    ctx.fillStyle = f.col; ctx.fill();
+    ctx.strokeStyle = "rgba(30,30,30,.35)"; ctx.stroke();
+  }
+  document.getElementById("hud").textContent =
+    parts.length + " parts · drag to orbit · wheel to zoom";
+}
+let drag = null;
+cv.onpointerdown = e => drag = [e.clientX, e.clientY];
+cv.onpointermove = e => { if (!drag) return;
+  az += (e.clientX-drag[0])*0.008; el = Math.max(0.1, Math.min(1.4, el+(e.clientY-drag[1])*0.005));
+  drag = [e.clientX, e.clientY]; draw(); };
+cv.onpointerup = () => drag = null;
+cv.onwheel = e => { zoom *= e.deltaY < 0 ? 1.1 : 0.9; draw(); e.preventDefault(); };
+onresize = draw;
+// MCP Apps host bridge: receive the tool result carrying geometry, and be
+// ready to call tools back later (click-to-inspect is the next slice).
+addEventListener("message", ev => {
+  const d = ev.data;
+  const g = d && (d.structuredContent || (d.params && d.params.structuredContent) || d);
+  if (g && g.parts) { parts = g.parts; draw(); }
+});
+draw();
+</script></body></html>

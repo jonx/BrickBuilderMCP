@@ -6,7 +6,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **build
 
 *A 1,024-piece fortress city designed entirely through these tools — 1,576 verified stud connections, zero floating parts, zero collisions, validated at every stage. The model is [examples/fortress_city.ldr](examples/fortress_city.ldr); open it in Studio.*
 
-Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 56 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
+Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 57 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
 > **Status: early days, but the foundation is now load-bearing.** The pipeline runs end-to-end — install, talk to Claude, get an exportable `.ldr` — and the connection model is enforced for the entire 24k-part catalog: every placement reports what it actually clutches, strict mode rejects physically impossible positions, and the validator's ground truth is real stud↔receiver mating (in both directions — hanging parts under overhangs is a first-class connection). Structured architecture (walls, towers, gates, roofs — the fortress above) builds reliably through the helpers.
 >
@@ -145,7 +145,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 ## The tools, grouped
 
-56 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
+57 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
 
 ### Model state
 

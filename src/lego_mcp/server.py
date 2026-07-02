@@ -733,6 +733,43 @@ def list_parts(limit: int = 200, subassembly: str | None = None) -> dict[str, An
     }
 
 
+def _viewer_html() -> str:
+    return (Path(__file__).parent / "viewer.html").read_text()
+
+
+@mcp.resource("ui://lego/viewer.html", mime_type="text/html")
+def viewer_resource() -> str:
+    """Interactive 3D viewer (MCP Apps): orbit/zoom the current model."""
+    return _viewer_html()
+
+
+@mcp.tool(
+    meta={"ui": {"resourceUri": "ui://lego/viewer.html",
+                 "preferredSize": {"width": 800, "height": 600}}},
+)
+def open_viewer(limit: int = 20000) -> dict[str, Any]:
+    """Open the interactive 3D viewer of the current model (MCP Apps hosts
+    render it inline; other hosts get the geometry JSON, and render_model
+    remains the PNG fallback). Returns every part as a box: position,
+    dimensions, display color."""
+    from lego_mcp.parts import color_rgb
+    out = []
+    for inst in list(STATE.parts.values())[:limit]:
+        part = PART_INDEX.get(inst.part_id)
+        if part is None:
+            continue
+        (x0, y0, z0), (x1, y1, z1) = part_aabb_world(inst, part)
+        r, g, b = color_rgb(inst.color)
+        out.append({
+            "id": inst.instance_id,
+            "part": inst.part_id,
+            "pos": [(x0 + x1) / 2, y1, (z0 + z1) / 2],   # bottom-face center
+            "dims": [x1 - x0, y1 - y0, z1 - z0],
+            "color": f"rgb({r},{g},{b})",
+        })
+    return {"parts": out, "count": len(out), "model": STATE.name}
+
+
 @mcp.tool()
 def consolidate_bricks() -> dict[str, Any]:
     """Merge 1x1-brick voxel constructions into bonded standard brickwork.
