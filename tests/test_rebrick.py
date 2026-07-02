@@ -159,3 +159,29 @@ def test_overhang_rows_prefer_supported_bricks():
     v = server.validate_model()
     assert v["valid"]
     assert v["summary"]["floating"] == 0
+
+
+def test_build_volume_declarative_shapes():
+    """A tower ring with a tunnel and a pyramid cap, described as regions —
+    one engine call, one rigid body, tunnel genuinely open."""
+    from lego_mcp import helpers
+    server.create_model("vol", include_manual=False)
+    server.add_part("3811", "green", 0, 0, 0)
+    helpers.build_volume([
+        {"shape": "ring", "x0": -120, "z0": -120, "x1": 120, "z1": 120,
+         "rows": 6, "color": "light_bluish_gray"},
+        {"shape": "box", "x0": -40, "z0": -140, "x1": 40, "z1": -80,
+         "rows": 3, "subtract": True},
+        {"shape": "pyramid", "x0": -120, "z0": -120, "x1": 120, "z1": 120,
+         "rows": 5, "start_row": 6, "color": "dark_bluish_gray"},
+    ])
+    v = server.validate_model()
+    assert v["valid"] and v["structurally_sound"]
+    assert v["structure"]["rigid_bodies"] == 1
+    blocking = []
+    for inst in server.STATE.parts.values():
+        p = PART_INDEX[inst.part_id]
+        (x0, _, z0), (x1, y1, z1) = part_aabb_world(inst, p)
+        if x0 < 0 < x1 and z0 < -110 < z1 and y1 > -72 and inst.part_id != "3811":
+            blocking.append(inst.instance_id)
+    assert blocking == []

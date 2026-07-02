@@ -1175,6 +1175,87 @@ def _compose_y_rotation(a: str, b: str) -> str | None:
     return _Y_ORDER[(_Y_ORDER.index(a) + _Y_ORDER.index(b)) % 4]
 
 
+def build_volume(regions: list[dict[str, Any]],
+                 base_y: float | None = None) -> dict[str, Any]:
+    """Generic construction: describe ANY shape as colored cell regions and
+    the bonding engine builds it as interlocked brickwork (running bond in
+    both axes, woven corners, bridged overhangs — all from one scorer).
+
+    `regions` are applied in order. Each: {"shape": "box"|"ring"|"pyramid"|
+    "gable", "x0","z0","x1","z1" (outer LDU bounds, multiples of 20 apart),
+    "rows": N, "start_row": 0, "color": "red"}. Extras: ring takes
+    "thickness_studs" (default 2); gable takes "ridge_axis" ("x"|"z");
+    pyramid/gable inset one stud per row upward. A region with
+    "subtract": true carves cells away (doors, windows, tunnels) — give it
+    "fill_color" to recolor instead of carving (glass).
+
+    Shapes carry no bonding logic: a castle, a sculpture, and a room are
+    all just cells to the engine. Check validate_model()['structurally_sound']
+    afterwards — physically impossible regions fail honestly.
+    """
+    from lego_mcp.rebrick import Cell, rebrick_instances
+    s = _server()
+    if not regions:
+        raise ValueError("regions must be a non-empty list")
+    xs = [float(r[k]) for r in regions for k in ("x0", "x1")]
+    zs = [float(r[k]) for r in regions for k in ("z0", "z1")]
+    resolved = _resolve_base_y(base_y, (min(xs), min(zs), max(xs), max(zs)))
+
+    cells: dict[tuple[int, int, int], int] = {}
+    for reg in regions:
+        shape = str(reg.get("shape", "box")).lower()
+        if shape not in ("box", "ring", "pyramid", "gable"):
+            raise ValueError(f"unknown shape {shape!r}")
+        x0, z0 = int(reg["x0"]), int(reg["z0"])
+        x1, z1 = int(reg["x1"]), int(reg["z1"])
+        if (x1 - x0) % 20 or (z1 - z0) % 20:
+            raise ValueError("region bounds must span whole studs (multiples of 20)")
+        rows = int(reg.get("rows", 1))
+        r0 = int(reg.get("start_row", 0))
+        subtract = bool(reg.get("subtract", False))
+        fill = reg.get("fill_color")
+        rgb = None
+        if not subtract:
+            rgb = s.resolve_color(reg.get("color", "light_bluish_gray"))
+        elif fill is not None:
+            rgb = s.resolve_color(fill)
+        t = int(reg.get("thickness_studs", 2)) * 20
+        ridge_x = str(reg.get("ridge_axis", "x")).lower() == "x"
+        for rr in range(rows):
+            row = r0 + rr
+            bx0, bz0, bx1, bz1 = x0, z0, x1, z1
+            if shape == "pyramid":
+                bx0, bx1 = x0 + rr * 20, x1 - rr * 20
+                bz0, bz1 = z0 + rr * 20, z1 - rr * 20
+            elif shape == "gable":
+                if ridge_x:
+                    bz0, bz1 = z0 + rr * 20, z1 - rr * 20
+                else:
+                    bx0, bx1 = x0 + rr * 20, x1 - rr * 20
+            if bx1 - bx0 < 20 or bz1 - bz0 < 20:
+                break
+            for cx in range(bx0 + 10, bx1, 20):
+                for cz in range(bz0 + 10, bz1, 20):
+                    if shape == "ring" and (bx0 + t < cx < bx1 - t
+                                            and bz0 + t < cz < bz1 - t):
+                        continue
+                    key = (cx, row, cz)
+                    if subtract and rgb is None:
+                        cells.pop(key, None)
+                    elif subtract:
+                        if key in cells:
+                            cells[key] = rgb
+                    else:
+                        cells[key] = rgb
+    cell_objs = [Cell(float(cx), resolved - row * BRICK_H, float(cz), c)
+                 for (cx, row, cz), c in cells.items()]
+    specs, _pt, _stats = rebrick_instances(cell_objs)
+    ids = _place_specs(specs)
+    return {"ok": True, "cells": len(cells), "bricks_placed": len(ids),
+            "base_y": resolved, "engine": "rebrick",
+            "subassembly": s.STATE.current_subassembly}
+
+
 def find_valid_placements(part_id: str, near_part_id: str,
                            limit: int = 20) -> dict[str, Any]:
     """List the ways `part_id` can REALLY connect to the in-model part
@@ -1305,6 +1386,7 @@ def register_helpers(mcp) -> None:
     mcp.tool()(build_stepped_gable_roof)
     mcp.tool()(build_stepped_pyramid_roof)
     mcp.tool()(build_floor)
+    mcp.tool()(build_volume)
     mcp.tool()(repeat_pattern)
     mcp.tool()(place_on_top)
     mcp.tool()(place_next_to)
