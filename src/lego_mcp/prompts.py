@@ -51,6 +51,15 @@ CONNECTIONS_BLURB = """\
   `connectivity` (which parts it mates with, studs engaged) and `warnings`.
   **A FLOATING or COLLISION warning means the model is already broken — fix
   it immediately, never build on top of it.**
+- **Connected is not the same as holding together.** A forest of 1x1 columns
+  standing side by side passes the floating check but is hundreds of separate
+  objects — a 1x1 mates one brick below and one above, so it can only form a
+  chain. Cohesion comes from bricks that SPAN two or more parts below
+  (running bond). `validate_model` reports it: `structurally_sound` must be
+  true and `structure.rigid_bodies` must be 1. If you generated a voxel/1x1
+  design, run `consolidate_bricks` — it re-tiles the layers with larger
+  bricks that cross the seams below, and put everything on a shared
+  baseplate so ground-level pieces bond too.
 """
 
 WORKFLOW_BLURB = """\

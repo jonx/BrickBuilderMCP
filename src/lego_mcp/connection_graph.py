@@ -30,6 +30,7 @@ class ConnectionEdge:
     b: str
     type_a: ConnectorType
     type_b: ConnectorType
+    studs: int = 1   # how many stud-receiver pairs mate between a and b
 
 
 def _complementary(t1: ConnectorType, t2: ConnectorType) -> bool:
@@ -77,8 +78,8 @@ def find_edges(world_by_id: dict[str, list[WorldConnector]]) -> list[ConnectionE
                    int(round(wc.z / CONNECTION_TOL)))
             bucket[key].append(wc)
 
-    edges: list[ConnectionEdge] = []
-    seen_pairs: set[tuple[str, str]] = set()
+    pair_counts: dict[tuple[str, str], int] = {}
+    pair_types: dict[tuple[str, str], tuple[ConnectorType, ConnectorType]] = {}
     for cell, wcs in bucket.items():
         if len(wcs) < 2:
             continue
@@ -89,16 +90,18 @@ def find_edges(world_by_id: dict[str, list[WorldConnector]]) -> list[ConnectionE
                     continue
                 if not _complementary(a.type, b.type):
                     continue
-                pair = (a.instance_id, b.instance_id)
-                pair = pair if pair[0] < pair[1] else (pair[1], pair[0])
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                edges.append(ConnectionEdge(
-                    a=pair[0], b=pair[1],
-                    type_a=a.type, type_b=b.type,
-                ))
-    return edges
+                if a.instance_id < b.instance_id:
+                    pair = (a.instance_id, b.instance_id)
+                    types = (a.type, b.type)
+                else:
+                    pair = (b.instance_id, a.instance_id)
+                    types = (b.type, a.type)
+                pair_counts[pair] = pair_counts.get(pair, 0) + 1
+                pair_types.setdefault(pair, types)
+    return [ConnectionEdge(a=p[0], b=p[1],
+                           type_a=pair_types[p][0], type_b=pair_types[p][1],
+                           studs=n)
+            for p, n in pair_counts.items()]
 
 
 def build_graph(parts) -> tuple[dict[str, set[str]], list[ConnectionEdge]]:
@@ -160,6 +163,131 @@ def find_floating_and_unanchored(parts) -> tuple[dict[str, set[str]],
         else:
             unanchored.add(pid)          # has neighbors but island doesn't reach ground
     return graph, edges, anchors, floating, unanchored
+
+
+# ---------------------------------------------------------------------------
+# Structural cohesion: is this ONE interlocked body, or a pile?
+# ---------------------------------------------------------------------------
+# Connectivity-to-ground (floating/unanchored) proves each part is *placeable*.
+# It does not prove the model holds together: a forest of independent 1x1
+# columns standing side by side passes every per-part check while being 2000
+# separate objects. These metrics capture cohesion.
+
+def _articulation_points(graph: dict[str, set[str]]) -> set[str]:
+    """Parts whose removal splits their component (single points of failure).
+    Iterative Tarjan — recursion-free so 20k-part models don't blow the stack."""
+    visited: set[str] = set()
+    disc: dict[str, int] = {}
+    low: dict[str, int] = {}
+    parent: dict[str, str] = {}
+    aps: set[str] = set()
+    timer = 0
+    for root in graph:
+        if root in visited:
+            continue
+        root_children = 0
+        visited.add(root)
+        disc[root] = low[root] = timer
+        timer += 1
+        stack: list[tuple[str, Iterable[str]]] = [(root, iter(graph[root]))]
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nb in it:
+                if nb == parent.get(node):
+                    continue
+                if nb in visited:
+                    low[node] = min(low[node], disc[nb])
+                else:
+                    parent[nb] = node
+                    visited.add(nb)
+                    disc[nb] = low[nb] = timer
+                    timer += 1
+                    stack.append((nb, iter(graph[nb])))
+                    advanced = True
+                    break
+            if not advanced:
+                stack.pop()
+                p = parent.get(node)
+                if p is None:
+                    continue
+                low[p] = min(low[p], low[node])
+                if p == root:
+                    root_children += 1
+                elif low[node] >= disc[p]:
+                    aps.add(p)
+        if root_children >= 2:
+            aps.add(root)
+    return aps
+
+
+def structural_analysis(parts,
+                        graph: dict[str, set[str]] | None = None,
+                        edges: list[ConnectionEdge] | None = None,
+                        ) -> dict:
+    """Cohesion report for the model.
+
+    - rigid_bodies: connected components of the stud graph. A build should be
+      ONE. Two towers that merely stand near each other are two.
+    - largest_body / fragment sample: to locate the pieces.
+    - single_stud_joints: non-grounded parts whose TOTAL stud engagement is 1
+      — they pivot/pop off (hinge risk).
+    - articulation_parts: parts whose removal splits the structure; their
+      ratio is high in chain-like builds and low in well-bonded ones.
+    - spanning_ratio: fraction of elevated parts resting on >= 2 distinct
+      parts below — the masonry-bond measure (1x1 columns score 0).
+    """
+    if graph is None or edges is None:
+        graph, edges = build_graph(parts)
+
+    # Connected components, largest first.
+    seen: set[str] = set()
+    components: list[list[str]] = []
+    for pid in graph:
+        if pid in seen:
+            continue
+        comp = [pid]
+        seen.add(pid)
+        stack = [pid]
+        while stack:
+            cur = stack.pop()
+            for nb in graph[cur]:
+                if nb not in seen:
+                    seen.add(nb)
+                    comp.append(nb)
+                    stack.append(nb)
+        components.append(comp)
+    components.sort(key=len, reverse=True)
+
+    engagement: dict[str, int] = defaultdict(int)
+    for e in edges:
+        engagement[e.a] += e.studs
+        engagement[e.b] += e.studs
+    anchors = find_anchors(parts)
+
+    single_stud = [pid for pid in graph
+                   if pid not in anchors and engagement.get(pid, 0) == 1]
+
+    aps = _articulation_points(graph)
+
+    elevated = [pid for pid in graph if pid not in anchors]
+    spanning = 0
+    for pid in elevated:
+        below = [n for n in graph[pid] if parts[n].y > parts[pid].y]
+        if len(below) >= 2:
+            spanning += 1
+    spanning_ratio = (spanning / len(elevated)) if elevated else 1.0
+
+    return {
+        "rigid_bodies": len(components),
+        "largest_body": len(components[0]) if components else 0,
+        "fragment_sample": [c[0] for c in components[1:6]],
+        "single_stud_joints": len(single_stud),
+        "single_stud_sample": sorted(single_stud)[:5],
+        "articulation_parts": len(aps),
+        "articulation_ratio": round(len(aps) / len(graph), 3) if graph else 0.0,
+        "spanning_ratio": round(spanning_ratio, 3),
+    }
 
 
 # ---------------------------------------------------------------------------

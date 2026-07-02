@@ -734,6 +734,57 @@ def list_parts(limit: int = 200, subassembly: str | None = None) -> dict[str, An
 
 
 @mcp.tool()
+def consolidate_bricks() -> dict[str, Any]:
+    """Merge 1x1-brick voxel constructions into bonded standard brickwork.
+
+    1x1 columns can never bond — each 1x1 mates one brick below and one
+    above, so voxel-style models are really hundreds of separate towers.
+    This re-tiles every layer with larger bricks (1x2..2x10) of the same
+    color, choosing placements that CROSS the seams of the layer below
+    (running bond in both axes). Shape and colors are preserved exactly;
+    the part count usually drops ~3x and the model becomes one rigid body.
+
+    Only 1x1 bricks (3005) on the stud grid are converted; everything else
+    is untouched. Saves checkpoint "before_consolidate" first; undo history
+    is cleared (restore the checkpoint to go back).
+    """
+    from lego_mcp.connection_graph import structural_analysis
+    from lego_mcp.rebrick import rebrick_instances
+
+    before_parts = len(STATE.parts)
+    before_structure = structural_analysis(STATE.parts)
+    save_checkpoint("before_consolidate")
+
+    specs, passthrough, stats = rebrick_instances(list(STATE.parts.values()))
+    STATE.parts = {inst.instance_id: inst for inst in passthrough}
+    for spec in specs:
+        iid = STATE.new_id()
+        STATE.parts[iid] = PartInstance(
+            instance_id=iid, part_id=spec["part_id"], color=spec["color"],
+            x=spec["x"], y=spec["y"], z=spec["z"], rotation=spec["rotation"],
+            subassembly=STATE.current_subassembly,
+        )
+        if not STATE.builder_mode:
+            STATE.built.add(iid)
+    STATE.built &= set(STATE.parts)
+    STATE._undo.clear()
+    STATE._redo.clear()
+
+    after_structure = structural_analysis(STATE.parts)
+    return {
+        "ok": True,
+        "parts_before": before_parts,
+        "parts_after": len(STATE.parts),
+        "converted_cells": stats["cells_in"],
+        "passthrough_parts": stats["passthrough"],
+        "rigid_bodies_before": before_structure["rigid_bodies"],
+        "rigid_bodies_after": after_structure["rigid_bodies"],
+        "spanning_ratio_after": after_structure["spanning_ratio"],
+        "checkpoint": "before_consolidate",
+    }
+
+
+@mcp.tool()
 def bill_of_materials(subassembly: str | None = None,
                       bricklink: bool = False) -> dict[str, Any]:
     """The orderable parts list for the current model.
@@ -1340,12 +1391,34 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
     unanchored_count = 0
     grid_errors = 0
     edges_count = 0
+    structure: dict[str, Any] | None = None
     from lego_mcp.connection_graph import (
-        find_floating_and_unanchored, vertical_seam_score, wall_bond_quality,
+        find_floating_and_unanchored, structural_analysis,
+        vertical_seam_score, wall_bond_quality,
     )
     if check_support:
         graph, edges, anchors, floating_ids, unanchored_ids = find_floating_and_unanchored(STATE.parts)
         edges_count = len(edges)
+        structure = structural_analysis(STATE.parts, graph=graph, edges=edges)
+        if structure["rigid_bodies"] > 1 and len(errors) < max_errors:
+            errors.append({
+                "type": "fragmented_structure",
+                "message": (
+                    f"The model is {structure['rigid_bodies']} separate rigid "
+                    f"bodies (largest holds {structure['largest_body']} of "
+                    f"{len(STATE.parts)} parts) — the pieces stand next to "
+                    "each other but nothing ties them together. It would fall "
+                    "apart when picked up."
+                ),
+                "fragment_sample": structure["fragment_sample"],
+                "suggestion": (
+                    "Bond the fragments: place bricks that SPAN two or more "
+                    "parts below (running bond), replace 1x1 columns with "
+                    "longer bricks (consolidate_bricks does this "
+                    "automatically), or seat everything on a shared "
+                    "baseplate."
+                ),
+            })
         floating_count = len(floating_ids)
         unanchored_count = len(unanchored_ids)
         for iid in sorted(floating_ids):
@@ -1390,8 +1463,9 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
     bond_quality = wall_bond_quality(STATE.parts)
 
     issue_count = collision_count + unknown_count + floating_count + unanchored_count + grid_errors
-    return {
-        "valid": issue_count == 0,
+    valid = issue_count == 0
+    out: dict[str, Any] = {
+        "valid": valid,
         "errors": errors,
         "summary": {
             "parts": len(STATE.parts),
@@ -1406,6 +1480,11 @@ def validate_model(max_errors: int = 200, check_support: bool = True) -> dict[st
             "errors_truncated": issue_count > len(errors),
         },
     }
+    if structure is not None:
+        out["structure"] = structure
+        out["structurally_sound"] = valid and structure["rigid_bodies"] <= 1
+        out["summary"]["rigid_bodies"] = structure["rigid_bodies"]
+    return out
 
 
 def _suggest_for_floating(inst) -> str:

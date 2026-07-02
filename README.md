@@ -6,7 +6,7 @@ An [MCP](https://modelcontextprotocol.io) server that lets an LLM design **build
 
 *A 1,024-piece fortress city designed entirely through these tools — 1,576 verified stud connections, zero floating parts, zero collisions, validated at every stage. The model is [examples/fortress_city.ldr](examples/fortress_city.ldr); open it in Studio.*
 
-Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 55 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
+Drop it into Claude Desktop, ask Claude *"build me a small red house on a tan baseplate,"* and the LLM gets 56 semantic tools, 6 prompts, and 5 reference resources covering: real LDraw catalog (24,009 parts), buildability checks (no floating / no collisions / no overlaps), connection-aware bonding, builder mode for piece-by-piece assembly, persistent projects, autosave, inline render previews in the chat, and a debug toolkit (`render_validation`, `inspect_part`, `collision_detail`, `describe_errors`). The output is a real `.ldr` / `.mpd` file you can open in [BrickLink Studio](https://www.bricklink.com/v3/studio/download.page) or [LeoCAD](https://www.leocad.org/).
 
 > **Status: early days, but the foundation is now load-bearing.** The pipeline runs end-to-end — install, talk to Claude, get an exportable `.ldr` — and the connection model is enforced for the entire 24k-part catalog: every placement reports what it actually clutches, strict mode rejects physically impossible positions, and the validator's ground truth is real stud↔receiver mating (in both directions — hanging parts under overhangs is a first-class connection). Structured architecture (walls, towers, gates, roofs — the fortress above) builds reliably through the helpers.
 >
@@ -60,6 +60,7 @@ The toolchain enforces these so what the LLM exports is actually buildable:
 2. **Anchored rule** — connected islands must reach the ground via a chain of stud connections (in any direction). A "tower" whose bricks touch each other but the whole thing levitates is reported as `unanchored`.
 3. **No overlap** — bricks must not occupy the same AABB. `add_part(strict=True)` rejects overlapping and unconnected placements at insertion time, and **every `add_part`/`move_part`/`rotate_part` result carries a `connectivity` report + `warnings`** so problems surface immediately, not at the next `validate_model`.
 4. **Real geometry** — AABBs, stud positions, and dimensions come from actually-parsed LDraw `.dat` files (recursively through subparts and `stug-NxN` stud-group primitives). A "Brick 2x4" really is 80 LDU × 40 LDU × 24 LDU with 8 studs at the correct positions.
+5. **Cohesion rule** — connected-to-ground is not the same as holding together: a forest of 1x1 columns passes rules 1–2 while being hundreds of separate objects. `validate_model` therefore also reports `structure` (rigid bodies, single-stud joints, articulation points, spanning ratio) and a top-level `structurally_sound` that requires the model to be ONE rigid body. `consolidate_bricks` converts 1x1 voxel designs into bonded brickwork (running bond in both axes) automatically.
 
 ---
 
@@ -144,7 +145,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 
 ## The tools, grouped
 
-55 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
+56 tools total. **The recommended order of preference when the LLM is building**: high-level helpers → connection-guaranteed placement (`find_valid_placements` + `add_part_at_placement`, `place_on_top`) → raw `add_part` only as a debug fallback. Each call shows the **most useful arguments**; full signatures are in the tool docstrings.
 
 ### Model state
 
@@ -152,6 +153,7 @@ Rotations are **named**, not matrices: `identity`, `rot90y`, `rot180y`, `rot270y
 |---|---|
 | `create_model(name, include_manual=True)` | Reset to a fresh empty model. The result carries `getting_started` — the building manual (coordinates, connection rules, workflow, tool order) — so the LLM gets the rules at the exact moment a build begins. The same manual ships as MCP server `instructions` at connection time. |
 | `list_parts(limit, subassembly)` | List current parts (optionally filtered to one subassembly). |
+| `consolidate_bricks()` | Re-tile 1x1 voxel constructions into bonded standard brickwork: larger bricks that CROSS the seams of the layer below (running bond in both axes). Same shape/colors, ~3x fewer parts, one rigid body. Saves checkpoint `before_consolidate`. |
 | `bill_of_materials(subassembly, bricklink=False)` | The orderable parts list: quantities per (part_id, color) with part + color names, sorted most-needed first. `bricklink=True` also returns a BrickLink Wanted List XML (`bricklink_xml`) you can upload to order; colors without a verified BrickLink mapping are flagged in `bricklink_warnings` rather than guessed. |
 
 ### Placement (raw)
@@ -358,6 +360,7 @@ Three one-shot commands that work on an `.ldr` / `.mpd` file from the shell — 
 - `lego-mcp render <file>` — render to PNG (below).
 - `lego-mcp bom <file>` — the orderable parts list (below).
 - `lego-mcp instructions <file>` — step-by-step build order (below).
+- `lego-mcp rebrick <file>` — consolidate 1x1 voxels into bonded brickwork (below).
 
 ### `lego-mcp render`
 
@@ -401,6 +404,17 @@ All flags:
 | `-q, --quiet` | off | Suppress progress lines on stdout. |
 
 The watermark draws with a TTF font when one is available (Helvetica / Arial / DejaVu probed in order), falling back to PIL's bitmap default on minimal systems so it never hard-fails.
+
+### `lego-mcp rebrick` — make voxel models hold together
+
+```bash
+lego-mcp rebrick mosaic.ldr -o mosaic_bonded.ldr
+# parts:        10000 -> 2133
+# rigid bodies: 100 -> 1
+# spanning:     53% of elevated bricks rest on 2+ supports
+```
+
+Voxel-style models (mosaics, sculptures, heightmaps) built from 1x1 bricks are really hundreds of separate columns — a 1x1 can only chain, never bond. This re-tiles every layer with larger same-color bricks that cross the seams of the layer below, turning the pile into one rigid body. Put the model on a shared baseplate first so ground-level pieces bond too.
 
 ### `lego-mcp bom` — the parts you need to order
 

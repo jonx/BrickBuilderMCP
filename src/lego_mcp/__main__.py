@@ -6,6 +6,7 @@ Subcommands:
     render <file> ...    render an .ldr / .mpd file to PNG (see `render -h`)
     bom <file> ...       orderable parts list for a model (see `bom -h`)
     instructions <file>  step-by-step build order (see `instructions -h`)
+    rebrick <file>       consolidate 1x1 voxels into bonded brickwork (see `rebrick -h`)
     -h | --help          print this help
 """
 
@@ -32,6 +33,9 @@ def main() -> None:
     if args and args[0] == "instructions":
         from lego_mcp.cli_bom import instructions_cmd
         sys.exit(instructions_cmd(args[1:]))
+    if args and args[0] == "rebrick":
+        from lego_mcp.cli_rebrick import rebrick_cmd
+        sys.exit(rebrick_cmd(args[1:]))
     from lego_mcp.server import run
     run()
 
