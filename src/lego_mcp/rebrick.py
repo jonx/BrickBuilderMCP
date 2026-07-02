@@ -50,6 +50,26 @@ W_ORIENT = 0.5   # nudge toward the level's preferred orientation (lamination)
 # brick then starts mid-span and crosses it. This is what makes running bond
 # emerge instead of phase-locked identical layers stacking into columns.
 W_ALIGN = 3.0
+# Penalty for a brick that touches NO support at all when the layer below
+# exists (an overhang, e.g. the row above a door void). Strong enough that a
+# longer brick reaching the flanking wall always wins — lintels emerge from
+# the same scoring, not from a special case.
+W_UNSUPPORTED = 25.0
+
+
+class Cell:
+    """A virtual 1x1 voxel. Shape generators (rooms, walls, roofs, imported
+    sculptures — anything) describe geometry as Cells and feed them to
+    `rebrick_instances`; the engine turns ANY cell region into bonded
+    brickwork. Shapes never contain bonding logic."""
+    __slots__ = ("part_id", "color", "x", "y", "z")
+
+    def __init__(self, x: float, y: float, z: float, color: int):
+        self.part_id = "3005"
+        self.color = color
+        self.x = x
+        self.y = y
+        self.z = z
 
 
 def _snap(value: float, unit: float) -> int | None:
@@ -92,6 +112,7 @@ def extract_cells(instances: Iterable[Any]
 def _tile_layer(layer: dict[tuple[int, int], int],
                 below_owner: dict[tuple[int, int], int],
                 level: int,
+                has_below: bool = False,
                 ) -> list[dict[str, Any]]:
     """Tile one layer's colored cells with bricks. Returns placements, each
     {"part_id", "color", "cells": [(gx, gz), ...], "rotation"}."""
@@ -148,6 +169,8 @@ def _tile_layer(layer: dict[tuple[int, int], int],
                             aligned += 1
                 score = (W_SEAM * seams + W_SUPPORT * len(supports)
                          + W_AREA * dx * dz - W_ALIGN * aligned)
+                if has_below and not supports:
+                    score -= W_UNSUPPORTED
                 if (rot == "identity") == prefer_x and length != width:
                     score += W_ORIENT
                 if best is None or score > best[0]:
@@ -175,7 +198,8 @@ def rebrick_cells(cells: dict[tuple[int, int, int], int],
     specs: list[dict[str, Any]] = []
     below_owner: dict[tuple[int, int], int] = {}
     for level in sorted(by_level):
-        placements = _tile_layer(by_level[level], below_owner, level)
+        placements = _tile_layer(by_level[level], below_owner, level,
+                                 has_below=(level - 1) in by_level)
         below_owner = {}
         for p in placements:
             xs = [c[0] for c in p["cells"]]

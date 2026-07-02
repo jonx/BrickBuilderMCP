@@ -106,3 +106,56 @@ def test_extract_cells_partitions_lattices():
     lattices, passthrough = extract_cells(insts)
     assert len(passthrough) == 2
     assert (0, 0, 0) in lattices and (10, 10, 4) in lattices
+
+
+# ---------------------------------------------------------------------------
+# The generic pipeline: shapes are cell sets, the engine does the bonding
+# ---------------------------------------------------------------------------
+
+def _room_with_openings():
+    server.create_model("room_generic", include_manual=False)
+    from lego_mcp import helpers
+    return helpers.build_room(-140, -80, 140, 80, height_rows=4, color="red",
+        openings={"south": [{"center": 140, "width": 40, "bottom_row": 0,
+                             "height_rows": 3, "type": "door"}],
+                  "north": [{"center": 140, "width": 80, "bottom_row": 1,
+                             "height_rows": 2, "style": "arch"}]})
+
+
+def test_engine_room_is_one_sound_body():
+    """A room with a door and a window, built as cells through the engine:
+    corners weave and the lintel bridges without any room-specific logic."""
+    r = _room_with_openings()
+    assert r["engine"] == "rebrick"
+    v = server.validate_model()
+    assert v["valid"] and v["structurally_sound"]
+    assert v["structure"]["rigid_bodies"] == 1
+    assert v["summary"]["floating"] == 0
+    assert v["summary"]["collisions"] == 0
+
+
+def test_engine_room_door_is_open():
+    _room_with_openings()
+    blocking = []
+    for inst in server.STATE.parts.values():
+        p = PART_INDEX[inst.part_id]
+        (x0, _, z0), (x1, y1, z1) = part_aabb_world(inst, p)
+        if x0 < 0 < x1 and z0 < -80 < z1 and y1 > -72:
+            blocking.append(inst.instance_id)
+    assert blocking == []
+
+
+def test_overhang_rows_prefer_supported_bricks():
+    """A wall with a 2-stud void: the row above must bridge it (no floating).
+    This is the W_UNSUPPORTED scoring, not a lintel special case."""
+    server.create_model("lintel", include_manual=False)
+    for gx in range(8):
+        if gx in (3, 4):
+            continue                          # void columns at ground level
+        server.add_part("3005", "red", gx * 20, 0, 0)
+    for gx in range(8):                        # full row above the void
+        server.add_part("3005", "red", gx * 20, -24, 0)
+    server.consolidate_bricks()
+    v = server.validate_model()
+    assert v["valid"]
+    assert v["summary"]["floating"] == 0

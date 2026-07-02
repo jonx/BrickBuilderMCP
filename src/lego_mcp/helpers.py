@@ -558,16 +558,43 @@ def build_perimeter(points: list,
 # build_room — rectangle wrapper around build_perimeter
 # ---------------------------------------------------------------------------
 
+def _place_specs(specs: list[dict[str, Any]]) -> list[str]:
+    """Insert brick placement specs (from the rebrick engine) into the model."""
+    s = _server()
+    ids: list[str] = []
+    for spec in specs:
+        iid = s.STATE.new_id()
+        s.STATE.parts[iid] = s.PartInstance(
+            instance_id=iid, part_id=spec["part_id"], color=spec["color"],
+            x=spec["x"], y=spec["y"], z=spec["z"], rotation=spec["rotation"],
+            subassembly=s.STATE.current_subassembly)
+        if not s.STATE.builder_mode:
+            s.STATE.built.add(iid)
+        ids.append(iid)
+    return ids
+
+
 def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
                 height_rows: int = 5,
                 color: str | int = "light_bluish_gray",
                 base_y: float | None = None,
                 strict_grid: bool = True,
                 palette: list[str] | None = None,
+                openings: dict[str, list[dict[str, Any]]] | None = None,
                 ) -> dict[str, Any]:
     """Build a rectangular hollow room with bonded corners.
 
-    Convenience wrapper for `build_perimeter` using rectangular outer points.
+    Without `openings`: convenience wrapper for `build_perimeter`.
+
+    With `openings`: the room is described as a CELL REGION (the wall ring,
+    minus door voids, with window cells recolored to glass) and handed to
+    the generic bonding engine (`rebrick`), which tiles any region with
+    seam-crossing brickwork — corners weave and lintels bridge because the
+    engine scores it that way, not because rooms are special. `openings`
+    maps sides to opening lists: `{"south": [{"center": 120, "width": 80,
+    "bottom_row": 0, "height_rows": 3, "style": "arch", "type": "door"}]}`
+    — sides: south = z_min wall, north = z_max, west = x_min, east = x_max;
+    `center` is measured along the wall from its min endpoint.
     """
     if strict_grid:
         for v, name in ((x_min, "x_min"), (x_max, "x_max"),
@@ -576,15 +603,83 @@ def build_room(x_min: float, z_min: float, x_max: float, z_max: float,
                 raise ValueError(f"{name}={v} not on half-stud grid")
     if x_max <= x_min or z_max <= z_min:
         raise ValueError("room bounds must have positive width and depth")
-    return build_perimeter(
-        points=[[x_min, z_min], [x_max, z_min], [x_max, z_max], [x_min, z_max]],
-        height_rows=height_rows,
-        color=color,
-        base_y=base_y,
-        thickness_studs=2,
-        palette=palette,
-        strict_grid=strict_grid,
-    )
+    if openings is None:
+        return build_perimeter(
+            points=[[x_min, z_min], [x_max, z_min], [x_max, z_max], [x_min, z_max]],
+            height_rows=height_rows,
+            color=color,
+            base_y=base_y,
+            thickness_studs=2,
+            palette=palette,
+            strict_grid=strict_grid,
+        )
+
+    unknown = set(openings) - {"south", "north", "west", "east"}
+    if unknown:
+        raise ValueError(f"unknown opening sides {sorted(unknown)}; "
+                         "use south/north/west/east")
+    from lego_mcp.rebrick import Cell, rebrick_instances
+    s = _server()
+    wall_rgb = s.resolve_color(color)
+    resolved_y = _resolve_base_y(base_y, (x_min - 20, z_min - 20,
+                                          x_max + 20, z_max + 20))
+
+    # The wall ring as cells: outer band minus interior. 2-stud walls
+    # centered on the rectangle edges; cell centers on the odd-10 offsets.
+    SIDES = {
+        "south": ("x", z_min, x_min),   # (wall axis, band centerline, axis start)
+        "north": ("x", z_max, x_min),
+        "west":  ("z", x_min, z_min),
+        "east":  ("z", x_max, z_min),
+    }
+    cells: list[Cell] = []
+    ix0, ix1 = int(x_min), int(x_max)
+    iz0, iz1 = int(z_min), int(z_max)
+    for row in range(height_rows):
+        y = resolved_y - row * BRICK_H
+        # Per-row opening spans, keyed by side.
+        spans: dict[str, list[tuple[float, float, int | None]]] = {}
+        for side, specs_list in openings.items():
+            axis, _band, a_start = SIDES[side]
+            a_end = ix1 if axis == "x" else iz1
+            out = []
+            for op in specs_list or []:
+                span = _opening_span(op, row, axis, a_start, a_end)
+                if span is None:
+                    continue
+                role = str(op.get("type", op.get("kind", ""))).lower()
+                fill = op.get("fill_color",
+                              None if role == "door" else "trans_clear")
+                out.append((span[0], span[1],
+                            None if fill is None else s.resolve_color(fill)))
+            spans[side] = out
+        for cx in range(ix0 - 10, ix1 + 11, 20):
+            for cz in range(iz0 - 10, iz1 + 11, 20):
+                if (ix0 + 30 <= cx <= ix1 - 30) and (iz0 + 30 <= cz <= iz1 - 30):
+                    continue                     # interior hollow
+                rgb = wall_rgb
+                skip = False
+                for side, side_spans in spans.items():
+                    axis, band, _ = SIDES[side]
+                    on_band = (abs(cz - band) <= 20) if axis == "x" else (abs(cx - band) <= 20)
+                    if not on_band:
+                        continue
+                    coord = cx if axis == "x" else cz
+                    for (a, b, fill) in side_spans:
+                        if a - 0.1 <= coord <= b + 0.1:
+                            if fill is None:
+                                skip = True
+                            else:
+                                rgb = fill
+                            break
+                if not skip:
+                    cells.append(Cell(float(cx), y, float(cz), rgb))
+
+    specs, _passthrough, _stats = rebrick_instances(cells)
+    ids = _place_specs(specs)
+    return {"ok": True, "bricks_placed": len(ids),
+            "cells": len(cells), "engine": "rebrick",
+            "subassembly": s.STATE.current_subassembly}
 
 
 # ---------------------------------------------------------------------------
