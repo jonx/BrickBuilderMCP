@@ -737,7 +737,7 @@ def _viewer_html() -> str:
     return (Path(__file__).parent / "viewer.html").read_text()
 
 
-@mcp.resource("ui://lego/viewer.html", mime_type="text/html+mcp")
+@mcp.resource("ui://lego/viewer.html", mime_type="text/html;profile=mcp-app")
 def viewer_resource() -> str:
     """Interactive 3D viewer (MCP Apps): orbit/zoom the current model."""
     return _viewer_html()

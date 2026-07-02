@@ -51,12 +51,34 @@ cv.onpointermove = e => { if (!drag) return;
 cv.onpointerup = () => drag = null;
 cv.onwheel = e => { zoom *= e.deltaY < 0 ? 1.1 : 0.9; draw(); e.preventDefault(); };
 onresize = draw;
-// MCP Apps host bridge: receive the tool result carrying geometry, and be
-// ready to call tools back later (click-to-inspect is the next slice).
+// MCP Apps bridge (spec 2026-01-26): JSON-RPC over postMessage. The view
+// MUST send ui/initialize; the host then pushes ui/notifications/tool-result
+// whose params.structuredContent carries our geometry. We also re-fetch via
+// tools/call so a Refresh works after the model changes.
+let msgId = 0; const pending = {};
+function rpc(method, params) {
+  return new Promise(res => {
+    const id = ++msgId; pending[id] = res;
+    parent.postMessage({jsonrpc: "2.0", id, method, params}, "*");
+  });
+}
+function show(g) { if (g && g.parts) { parts = g.parts; draw(); } }
 addEventListener("message", ev => {
-  const d = ev.data;
-  const g = d && (d.structuredContent || (d.params && d.params.structuredContent) || d);
-  if (g && g.parts) { parts = g.parts; draw(); }
+  const m = ev.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+  if (m.id !== undefined && pending[m.id]) { pending[m.id](m.result); delete pending[m.id]; return; }
+  if (m.method === "ui/notifications/tool-result" && m.params)
+    show(m.params.structuredContent);
 });
+async function refresh() {
+  const r = await rpc("tools/call", {name: "open_viewer", arguments: {}});
+  show(r && r.structuredContent);
+}
+rpc("ui/initialize", {
+  protocolVersion: "2026-01-26",
+  clientInfo: {name: "lego-viewer", version: "1.0.0"},
+  appCapabilities: {availableDisplayModes: ["inline"]},
+}).then(refresh);
+document.getElementById("hud").onclick = refresh;
 draw();
 </script></body></html>
