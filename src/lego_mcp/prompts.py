@@ -61,7 +61,7 @@ CONNECTIONS_BLURB = """\
   bricks that cross the seams below, and put everything on a shared
   baseplate so ground-level pieces bond too.
 - **Any shape = cells + the engine.** `build_volume(regions)` builds
-  arbitrary shapes (box / ring / pyramid / gable, with subtract regions for
+  arbitrary shapes (box / ring / pyramid / gable / plate slab / outline, with subtract regions for
   doors and tunnels) as bonded brickwork through the same engine —
   `build_room(..., openings=...)` uses it for rooms with doors/windows.
   Prefer these over composing walls by hand.

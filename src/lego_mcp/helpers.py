@@ -1182,30 +1182,80 @@ def build_volume(regions: list[dict[str, Any]],
     both axes, woven corners, bridged overhangs — all from one scorer).
 
     `regions` are applied in order. Each: {"shape": "box"|"ring"|"pyramid"|
-    "gable", "x0","z0","x1","z1" (outer LDU bounds, multiples of 20 apart),
-    "rows": N, "start_row": 0, "color": "red"}. Extras: ring takes
-    "thickness_studs" (default 2); gable takes "ridge_axis" ("x"|"z");
-    pyramid/gable inset one stud per row upward. A region with
-    "subtract": true carves cells away (doors, windows, tunnels) — give it
-    "fill_color" to recolor instead of carving (glass).
+    "gable"|"slab"|"outline", "x0","z0","x1","z1" (outer LDU bounds,
+    multiples of 20 apart), "rows": N, "start_row": 0, "color": "red"}.
+    Extras: ring takes "thickness_studs" (default 2); gable takes
+    "ridge_axis" ("x"|"z"); pyramid/gable inset one stud per row upward.
+    "slab" builds a floor/flat-roof panel from PLATES: "layers" (default 2)
+    offset-seamed plate layers whose underside sits at start_row brick
+    heights — over a hollow room the interior plates hang from the layer
+    above, which is exactly how real LEGO panels work. "outline" takes
+    "points": [[x,z],...] (closed rectilinear polygon of wall centerlines)
+    instead of x0/z0/x1/z1 — arbitrary footprints, same woven bonding. A
+    region with "subtract": true carves cells away (doors, windows,
+    tunnels) — give it "fill_color" to recolor instead of carving (glass).
 
     Shapes carry no bonding logic: a castle, a sculpture, and a room are
     all just cells to the engine. Check validate_model()['structurally_sound']
     afterwards — physically impossible regions fail honestly.
     """
-    from lego_mcp.rebrick import Cell, rebrick_instances
+    from lego_mcp.rebrick import (Cell, PLATE_CATALOG, PLATE_H,
+                                  rebrick_cells, rebrick_instances)
     s = _server()
     if not regions:
         raise ValueError("regions must be a non-empty list")
-    xs = [float(r[k]) for r in regions for k in ("x0", "x1")]
-    zs = [float(r[k]) for r in regions for k in ("z0", "z1")]
+    xs, zs = [], []
+    for r in regions:
+        if "points" in r:
+            xs += [float(p[0]) for p in r["points"]]
+            zs += [float(p[1]) for p in r["points"]]
+        else:
+            xs += [float(r["x0"]), float(r["x1"])]
+            zs += [float(r["z0"]), float(r["z1"])]
     resolved = _resolve_base_y(base_y, (min(xs), min(zs), max(xs), max(zs)))
 
     cells: dict[tuple[int, int, int], int] = {}
+    plate_cells: dict[tuple[int, int, int], int] = {}   # (cx, plate_level, cz)
+    plate_y0: float | None = None
     for reg in regions:
         shape = str(reg.get("shape", "box")).lower()
-        if shape not in ("box", "ring", "pyramid", "gable"):
+        if shape not in ("box", "ring", "pyramid", "gable", "slab", "outline"):
             raise ValueError(f"unknown shape {shape!r}")
+        if shape == "outline":
+            pts = [(int(pp[0]), int(pp[1])) for pp in reg["points"]]
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+            rgb = s.resolve_color(reg.get("color", "light_bluish_gray"))
+            rows = int(reg.get("rows", 1))
+            r0 = int(reg.get("start_row", 0))
+            for (xa, za), (xb, zb) in zip(pts, pts[1:]):
+                if xa != xb and za != zb:
+                    raise ValueError("outline edges must be axis-aligned")
+                for row in range(r0, r0 + rows):
+                    if xa == xb:      # edge along z
+                        for cz in range(min(za, zb) - 10, max(za, zb) + 11, 20):
+                            for cx in (xa - 10, xa + 10):
+                                cells[(cx, row, cz)] = rgb
+                    else:             # edge along x
+                        for cx in range(min(xa, xb) - 10, max(xa, xb) + 11, 20):
+                            for cz in (za - 10, za + 10):
+                                cells[(cx, row, cz)] = rgb
+            continue
+        if shape == "slab":
+            x0, z0 = int(reg["x0"]), int(reg["z0"])
+            x1, z1 = int(reg["x1"]), int(reg["z1"])
+            layers = int(reg.get("layers", 2))
+            r0 = int(reg.get("start_row", 0))
+            rgb = s.resolve_color(reg.get("color", "light_bluish_gray"))
+            y0 = resolved - r0 * BRICK_H
+            if plate_y0 is None:
+                plate_y0 = y0
+            base_lvl = int(round((plate_y0 - y0) / PLATE_H))
+            for lv in range(layers):
+                for cx in range(x0 + 10, x1, 20):
+                    for cz in range(z0 + 10, z1, 20):
+                        plate_cells[(cx, base_lvl + lv, cz)] = rgb
+            continue
         x0, z0 = int(reg["x0"]), int(reg["z0"])
         x1, z1 = int(reg["x1"]), int(reg["z1"])
         if (x1 - x0) % 20 or (z1 - z0) % 20:
@@ -1250,8 +1300,18 @@ def build_volume(regions: list[dict[str, Any]],
     cell_objs = [Cell(float(cx), resolved - row * BRICK_H, float(cz), c)
                  for (cx, row, cz), c in cells.items()]
     specs, _pt, _stats = rebrick_instances(cell_objs)
+    if plate_cells:
+        # Plate lattice: tile directly with the plate catalog. Offsets place
+        # cells on their true world grid (odd-10 XZ within the region).
+        grid = {}
+        for (cx, lv, cz), c in plate_cells.items():
+            grid[((cx - 10) // 20, lv, (cz - 10) // 20)] = c
+        specs += rebrick_cells(grid, x_offset_ldu=10, z_offset_ldu=10,
+                               y_offset_ldu=int(-plate_y0),
+                               layer_height=PLATE_H, catalog=PLATE_CATALOG)
     ids = _place_specs(specs)
-    return {"ok": True, "cells": len(cells), "bricks_placed": len(ids),
+    return {"ok": True, "cells": len(cells) + len(plate_cells),
+            "bricks_placed": len(ids),
             "base_y": resolved, "engine": "rebrick",
             "subassembly": s.STATE.current_subassembly}
 

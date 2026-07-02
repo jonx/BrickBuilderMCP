@@ -180,7 +180,7 @@ These encode real LEGO masonry/architecture techniques so the LLM doesn't have t
 | `build_perimeter(points, height_rows, color, bond, base_y)` | Closed orthogonal outline (any rectilinear footprint from a plan/image). Alternates corner ownership by row. |
 | `build_wall_with_openings(x0, z0, x1, z1, height_rows, color, openings=[...])` | Straight wall with rectangular / round-arch / lancet openings. |
 | `build_stepped_gable_roof(...)` / `build_stepped_pyramid_roof(...)` | Connector-aware roofs. |
-| `build_volume(regions, base_y)` | **The generic builder**: describe any shape as ordered cell regions (`box`/`ring`/`pyramid`/`gable`, `subtract` regions for doors/tunnels, `fill_color` for glass) and the bonding engine tiles it as one interlocked body — woven corners and bridged lintels emerge from scoring, not from per-shape code. |
+| `build_volume(regions, base_y)` | **The generic builder**: describe any shape as ordered cell regions (`box`/`ring`/`pyramid`/`gable`/`slab` (plate floors/roofs over hollow rooms)/`outline` (arbitrary footprints), `subtract` regions for doors/tunnels, `fill_color` for glass) and the bonding engine tiles it as one interlocked body — woven corners and bridged lintels emerge from scoring, not from per-shape code. |
 | `build_floor(x_min, z_min, x_max, z_max, y, color, part_id)` | Tile a rectangle with plates. |
 | `build_corner(x, z, height_rows, color, brick_part)` | One-corner column (for hand-built rooms). |
 | `place_on_top(base_id, new_part_id, color, stud_offset_x, stud_offset_z, rotation)` | Stud-grid stacking from a known anchor. |

@@ -185,3 +185,44 @@ def test_build_volume_declarative_shapes():
         if x0 < 0 < x1 and z0 < -110 < z1 and y1 > -72 and inst.part_id != "3811":
             blocking.append(inst.instance_id)
     assert blocking == []
+
+
+def test_build_volume_slab_roof_over_hollow_room():
+    """A room with a door and a 2-layer plate roof spanning the hollow
+    interior: interior roof plates hang from the offset layer above —
+    a real LEGO panel, one rigid body, nothing floating."""
+    from lego_mcp import helpers
+    server.create_model("hollow", include_manual=False)
+    server.add_part("3811", "green", 0, 0, 0)
+    helpers.build_volume([
+        {"shape": "ring", "x0": -120, "z0": -80, "x1": 120, "z1": 80,
+         "rows": 4, "color": "red"},
+        {"shape": "box", "x0": -20, "z0": -100, "x1": 20, "z1": -60,
+         "rows": 3, "subtract": True},
+        {"shape": "slab", "x0": -120, "z0": -80, "x1": 120, "z1": 80,
+         "layers": 2, "start_row": 4, "color": "dark_bluish_gray"},
+    ])
+    v = server.validate_model()
+    assert v["valid"] and v["structurally_sound"]
+    assert v["structure"]["rigid_bodies"] == 1
+    assert v["summary"]["floating"] == 0
+    interior = [i for i in server.STATE.parts.values()
+                if -60 < i.x < 60 and -40 < i.z < 40
+                and abs(i.y + 28) < 20 and i.part_id != "3811"]
+    assert interior == []                    # genuinely hollow
+    plates = [i for i in server.STATE.parts.values()
+              if i.part_id in ("3036", "3035", "3832", "3034", "3031", "3795",
+                                "4477", "3020", "3021", "3666", "3022", "3710",
+                                "3623", "3023", "3024")]
+    assert plates                            # the roof really is plates
+
+
+def test_build_volume_outline_footprint():
+    """Arbitrary rectilinear outlines bond through the same engine."""
+    from lego_mcp import helpers
+    server.create_model("L", include_manual=False)
+    helpers.build_volume([{"shape": "outline", "rows": 3, "color": "tan",
+        "points": [[0, 0], [240, 0], [240, 160], [120, 160], [120, 80], [0, 80]]}])
+    v = server.validate_model()
+    assert v["valid"] and v["structurally_sound"]
+    assert v["structure"]["rigid_bodies"] == 1

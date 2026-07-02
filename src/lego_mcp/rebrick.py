@@ -37,6 +37,28 @@ BRICK_CATALOG: tuple[tuple[int, int, str], ...] = (
     (1, 1, "3005"),
 )
 
+# Plates (8 LDU tall) for slabs: floors and flat roofs. Two offset layers of
+# these form a rigid panel — the engine's anti-alignment scoring produces the
+# offset automatically.
+PLATE_CATALOG: tuple[tuple[int, int, str], ...] = (
+    (8, 6, "3036"),
+    (8, 4, "3035"),
+    (10, 2, "3832"),
+    (8, 2, "3034"),
+    (4, 4, "3031"),
+    (6, 2, "3795"),
+    (10, 1, "4477"),
+    (4, 2, "3020"),
+    (3, 2, "3021"),
+    (6, 1, "3666"),
+    (2, 2, "3022"),
+    (4, 1, "3710"),
+    (3, 1, "3623"),
+    (2, 1, "3023"),
+    (1, 1, "3024"),
+)
+PLATE_H = 8.0
+
 # Scoring weights: crossing a below-seam is what creates bond; resting on
 # several distinct bricks adds redundancy; area breaks ties toward fewer,
 # larger parts.
@@ -113,12 +135,15 @@ def _tile_layer(layer: dict[tuple[int, int], int],
                 below_owner: dict[tuple[int, int], int],
                 level: int,
                 has_below: bool = False,
+                catalog: tuple[tuple[int, int, str], ...] = BRICK_CATALOG,
+                prefer_x: bool | None = None,
                 ) -> list[dict[str, Any]]:
     """Tile one layer's colored cells with bricks. Returns placements, each
     {"part_id", "color", "cells": [(gx, gz), ...], "rotation"}."""
     remaining = dict(layer)
     placements: list[dict[str, Any]] = []
-    prefer_x = (level % 2 == 0)
+    if prefer_x is None:
+        prefer_x = (level % 2 == 0)
 
     # Raster scan with min-corner anchors. Phase variation between layers
     # comes from the W_ALIGN penalty (never end a brick on a below-seam),
@@ -134,7 +159,7 @@ def _tile_layer(layer: dict[tuple[int, int], int],
         ax, az = anchor
         color = remaining[anchor]
         best = None
-        for length, width, pid in BRICK_CATALOG:
+        for length, width, pid in catalog:
             orients = [(length, width, "identity")]
             if length != width:
                 orients.append((width, length, "rot90y"))
@@ -185,12 +210,36 @@ def _tile_layer(layer: dict[tuple[int, int], int],
     return placements
 
 
+def _layer_quality(placements: list[dict[str, Any]],
+                   below_owner: dict[tuple[int, int], int]) -> float:
+    """Bond quality of a candidate tiling: below-seams crossed minus a small
+    part-count pressure. Used to pick the better of two orientation passes."""
+    crossings = 0
+    for p in placements:
+        covered = set(p["cells"])
+        for (cx, cz) in covered:
+            for nb in ((cx + 1, cz), (cx, cz + 1)):
+                if nb not in covered:
+                    continue
+                oa, ob = below_owner.get((cx, cz)), below_owner.get(nb)
+                if oa is not None and ob is not None and oa != ob:
+                    crossings += 1
+    return crossings * 4.0 - len(placements) * 0.5
+
+
 def rebrick_cells(cells: dict[tuple[int, int, int], int],
                   x_offset_ldu: int = 0,
                   z_offset_ldu: int = 0,
-                  y_offset_ldu: int = 0) -> list[dict[str, Any]]:
+                  y_offset_ldu: int = 0,
+                  layer_height: float = BRICK_H,
+                  catalog: tuple[tuple[int, int, str], ...] = BRICK_CATALOG,
+                  ) -> list[dict[str, Any]]:
     """Consolidate one lattice of voxel cells bottom-up. Returns placement
-    specs with world coords: {"part_id", "color", "x", "y", "z", "rotation"}."""
+    specs with world coords: {"part_id", "color", "x", "y", "z", "rotation"}.
+
+    Each layer is tiled twice (both orientation preferences) and the pass
+    with the better bond quality wins — cheap lookahead that avoids greedy
+    phase-locks."""
     by_level: dict[int, dict[tuple[int, int], int]] = {}
     for (gx, level, gz), color in cells.items():
         by_level.setdefault(level, {})[(gx, gz)] = color
@@ -198,8 +247,14 @@ def rebrick_cells(cells: dict[tuple[int, int, int], int],
     specs: list[dict[str, Any]] = []
     below_owner: dict[tuple[int, int], int] = {}
     for level in sorted(by_level):
-        placements = _tile_layer(by_level[level], below_owner, level,
-                                 has_below=(level - 1) in by_level)
+        has_below = (level - 1) in by_level
+        candidates = [
+            _tile_layer(by_level[level], below_owner, level,
+                        has_below=has_below, catalog=catalog, prefer_x=pref)
+            for pref in ((level % 2 == 0), (level % 2 == 1))
+        ]
+        placements = max(candidates,
+                         key=lambda pl: _layer_quality(pl, below_owner))
         below_owner = {}
         for p in placements:
             xs = [c[0] for c in p["cells"]]
@@ -208,7 +263,7 @@ def rebrick_cells(cells: dict[tuple[int, int, int], int],
                 "part_id": p["part_id"],
                 "color": p["color"],
                 "x": (min(xs) + max(xs)) / 2 * STUD + x_offset_ldu,
-                "y": -(y_offset_ldu + level * BRICK_H),
+                "y": -(y_offset_ldu + level * layer_height),
                 "z": (min(zs) + max(zs)) / 2 * STUD + z_offset_ldu,
                 "rotation": p["rotation"],
             })
