@@ -744,8 +744,10 @@ def viewer_resource() -> str:
 
 
 @mcp.tool(
-    meta={"ui": {"resourceUri": "ui://lego/viewer.html",
-                 "preferredSize": {"width": 800, "height": 600}}},
+    # Flat key per the official ext-apps SDK (RESOURCE_URI_META_KEY);
+    # nested form kept for hosts that shipped against earlier drafts.
+    meta={"ui/resourceUri": "ui://lego/viewer.html",
+          "ui": {"resourceUri": "ui://lego/viewer.html"}},
 )
 def open_viewer(limit: int = 20000) -> dict[str, Any]:
     """Open the interactive 3D viewer of the current model (MCP Apps hosts
